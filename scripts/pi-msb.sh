@@ -108,11 +108,10 @@ pi-msb() {
         return 1
     }
 
-    command -v pi >/dev/null 2>&1 || {
-        echo "error: host pi not found" >&2
-        echo "       host Pi is used to resolve/refresh credentials" >&2
-        return 1
-    }
+    # Host Pi is optional: it is only used to resolve OpenRouter/OpenAI/
+    # Anthropic credentials. Bedrock tokens are minted independently.
+    local host_pi=0
+    command -v pi >/dev/null 2>&1 && host_pi=1
 
     local git_user_name=""
     local git_user_email=""
@@ -158,65 +157,70 @@ pi-msb() {
     # ~/.pi is never mounted into the sandbox.
     # ------------------------------------------------------------
 
-    credential="$(
-        pi auth print-api-key \
-            --provider openrouter \
-            2>/dev/null
-    )"
+    if (( host_pi )); then
 
-    if [[ -n "$credential" ]]; then
-        OPENROUTER_API_KEY="$credential"
-        export OPENROUTER_API_KEY
-
-        secret_args+=(
-            --secret "OPENROUTER_API_KEY@openrouter.ai"
-        )
-    fi
-
-    credential="$(
-        pi auth print-api-key \
-            --provider openai \
-            2>/dev/null
-    )"
-
-    if [[ -n "$credential" ]]; then
-        OPENAI_API_KEY="$credential"
-        export OPENAI_API_KEY
-
-        secret_args+=(
-            --secret "OPENAI_API_KEY@api.openai.com"
-        )
-    fi
-
-    credential="$(
-        pi auth print-api-key \
-            --provider anthropic \
-            2>/dev/null
-    )"
-
-    if [[ -n "$credential" ]]; then
-        ANTHROPIC_API_KEY="$credential"
-        export ANTHROPIC_API_KEY
-
-        secret_args+=(
-            --secret "ANTHROPIC_API_KEY@api.anthropic.com"
-        )
-    else
         credential="$(
-            pi auth print-bearer-token \
-                --provider anthropic \
-                --min-expiry 30m \
+            pi auth print-api-key \
+                --provider openrouter \
                 2>/dev/null
         )"
 
         if [[ -n "$credential" ]]; then
-            ANTHROPIC_OAUTH_TOKEN="$credential"
-            export ANTHROPIC_OAUTH_TOKEN
+            OPENROUTER_API_KEY="$credential"
+            export OPENROUTER_API_KEY
 
             secret_args+=(
-                --secret "ANTHROPIC_OAUTH_TOKEN@api.anthropic.com"
+                --secret "OPENROUTER_API_KEY@openrouter.ai"
             )
         fi
+
+        credential="$(
+            pi auth print-api-key \
+                --provider openai \
+                2>/dev/null
+        )"
+
+        if [[ -n "$credential" ]]; then
+            OPENAI_API_KEY="$credential"
+            export OPENAI_API_KEY
+
+            secret_args+=(
+                --secret "OPENAI_API_KEY@api.openai.com"
+            )
+        fi
+
+        credential="$(
+            pi auth print-api-key \
+                --provider anthropic \
+                2>/dev/null
+        )"
+
+        if [[ -n "$credential" ]]; then
+            ANTHROPIC_API_KEY="$credential"
+            export ANTHROPIC_API_KEY
+
+            secret_args+=(
+                --secret "ANTHROPIC_API_KEY@api.anthropic.com"
+            )
+        else
+            credential="$(
+                pi auth print-bearer-token \
+                    --provider anthropic \
+                    --min-expiry 30m \
+                    2>/dev/null
+            )"
+
+            if [[ -n "$credential" ]]; then
+                ANTHROPIC_OAUTH_TOKEN="$credential"
+                export ANTHROPIC_OAUTH_TOKEN
+
+                secret_args+=(
+                    --secret "ANTHROPIC_OAUTH_TOKEN@api.anthropic.com"
+                )
+            fi
+        fi
+    else
+        echo "Host pi not found: skipping OpenRouter/OpenAI/Anthropic credentials"
     fi
 
     # ------------------------------------------------------------
@@ -256,6 +260,18 @@ pi-msb() {
             fi
 
             echo "Bedrock: short-term token minted from profile '$bedrock_profile' ($bedrock_region, ${bedrock_expiry}s)"
+        fi
+    fi
+
+    if (( ${#secret_args[@]} == 0 )); then
+        echo "warning: no model credentials resolved on the host" >&2
+        if (( ! host_pi )); then
+            echo "       host pi not found (used for OpenRouter/OpenAI/Anthropic)" >&2
+        fi
+        if [[ "${PI_MSB_BEDROCK:-1}" == "0" ]]; then
+            echo "       Bedrock disabled (PI_MSB_BEDROCK=0)" >&2
+        else
+            echo "       Bedrock: configure AWS profile '$bedrock_profile' (PI_MSB_AWS_PROFILE)" >&2
         fi
     fi
 
