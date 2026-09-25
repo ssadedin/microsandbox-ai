@@ -1,3 +1,6 @@
+# Directory containing this script (used to locate capture_screenshots.py).
+_PI_MSB_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
 pi-msb() {
 
     local dir name
@@ -32,6 +35,70 @@ pi-msb() {
 
     local -a secret_args
     local -a create_mounts
+
+    # ------------------------------------------------------------
+    # Parse pi-msb specific options; everything else goes to Pi.
+    #
+    #   --with-screenshots [WINDOW]
+    #       Continuously capture a host (macOS) window into
+    #       /workspace/.pi-msb/screenshot.png so the agent can see it.
+    #       WINDOW is a window id or name substring; if omitted, the
+    #       user is asked to pick from a list of open windows.
+    # ------------------------------------------------------------
+
+    local screenshots=0
+    local screenshot_window="${PI_MSB_SCREENSHOT_WINDOW:-}"
+    local -a passthrough_args
+
+    [[ -n "$screenshot_window" ]] && screenshots=1
+
+    while (( $# > 0 )); do
+        case "$1" in
+            --with-screenshots=*)
+                screenshots=1
+                screenshot_window="${1#*=}"
+                shift
+                ;;
+            --with-screenshots)
+                screenshots=1
+                shift
+                if (( $# > 0 )) && [[ "$1" != -* ]]; then
+                    screenshot_window="$1"
+                    shift
+                fi
+                ;;
+            --)
+                passthrough_args+=( "$@" )
+                break
+                ;;
+            *)
+                passthrough_args+=( "$1" )
+                shift
+                ;;
+        esac
+    done
+
+    set -- "${passthrough_args[@]}"
+
+    if (( screenshots )); then
+        if [[ "$(uname -s)" != "Darwin" ]]; then
+            echo "error: --with-screenshots is only supported on macOS hosts" >&2
+            return 1
+        fi
+        command -v uv >/dev/null 2>&1 || {
+            echo "error: --with-screenshots requires uv on the host" >&2
+            return 1
+        }
+        [[ -f "$_PI_MSB_SCRIPT_DIR/capture_screenshots.py" ]] || {
+            echo "error: $_PI_MSB_SCRIPT_DIR/capture_screenshots.py not found" >&2
+            return 1
+        }
+
+        # Ask the user now, before the (slow) sandbox setup.
+        if [[ -z "$screenshot_window" ]]; then
+            screenshot_window="$(_pi_msb_choose_window)" || return 1
+        fi
+    fi
 
     host_uid="$(id -u)"
     host_gid="$(id -g)"
@@ -558,7 +625,64 @@ pi-msb() {
 
     pi_args+=( "$@" )
 
+    # ------------------------------------------------------------
+    # Screenshot proxy: capture on the host into the mounted
+    # workspace, where the guest sees it at /workspace/.pi-msb/.
+    # ------------------------------------------------------------
+
+    local screenshot_pid=""
+
+    if (( screenshots )); then
+        local shot_dir="$dir/.pi-msb"
+        local shot_file="$shot_dir/screenshot.png"
+        local shot_log="$shot_dir/screenshots.log"
+        local guest_shot="/workspace/.pi-msb/screenshot.png"
+
+        mkdir -p "$shot_dir" || return 1
+        # Keep the capture directory out of git.
+        [[ -f "$shot_dir/.gitignore" ]] || printf '*\n' > "$shot_dir/.gitignore"
+        rm -f "$shot_file"
+
+        echo "Starting screenshot capture for window: $screenshot_window"
+
+        uv run --quiet --no-project --with pyobjc-framework-Quartz \
+            python3 "$_PI_MSB_SCRIPT_DIR/capture_screenshots.py" \
+            --output "$shot_file" \
+            --interval "${PI_MSB_SCREENSHOT_INTERVAL:-2}" \
+            --max-size "${PI_MSB_SCREENSHOT_MAX_SIZE:-1600}" \
+            --parent-pid "$$" \
+            "$screenshot_window" \
+            > "$shot_log" 2>&1 &
+        screenshot_pid=$!
+
+        # Wait briefly for the first frame so failures are visible now.
+        local i
+        for (( i = 0; i < 50; i++ )); do
+            [[ -s "$shot_file" ]] && break
+            kill -0 "$screenshot_pid" 2>/dev/null || break
+            sleep 0.2
+        done
+
+        if [[ ! -s "$shot_file" ]]; then
+            echo "error: screenshot capture failed; see $shot_log" >&2
+            echo "       (if window titles are missing from the list, the terminal needs" >&2
+            echo "        Screen Recording permission: System Settings -> Privacy & Security)" >&2
+            sed 's/^/       /' "$shot_log" >&2
+            kill "$screenshot_pid" 2>/dev/null
+            return 1
+        fi
+
+        echo "Screenshot capture started (PID: $screenshot_pid, log: $shot_log)"
+
+        pi_args=(
+            --append-system-prompt "A live screenshot of the user's application window ($screenshot_window) is available at $guest_shot. It is refreshed every ${PI_MSB_SCREENSHOT_INTERVAL:-2} seconds from the host. Use the read tool on that file whenever you need to see the current state of the UI (e.g. after making a change, wait a few seconds and read it again)."
+            "${pi_args[@]}"
+        )
+    fi
+
     echo "Starting Pi in sandbox $name as $guest_user ($host_uid:$host_gid)"
+
+    local rc=0
 
     msb exec \
         -t \
@@ -573,7 +697,61 @@ pi-msb() {
         "${bedrock_env_args[@]}" \
         --workdir /workspace \
         "$name" \
-        -- bash -lc 'exec pi "$@"' pi "${pi_args[@]}"
+        -- bash -lc 'exec pi "$@"' pi "${pi_args[@]}" \
+    || rc=$?
+
+    if [[ -n "$screenshot_pid" ]]; then
+        kill "$screenshot_pid" 2>/dev/null
+        wait "$screenshot_pid" 2>/dev/null
+    fi
+
+    return "$rc"
+}
+
+# ----------------------------------------------------------------
+# Interactively choose a host window to capture. The menu goes to
+# stderr; the chosen window id is printed on stdout.
+# ----------------------------------------------------------------
+_pi_msb_choose_window() {
+    local listing choice id owner title size
+    local -a ids labels
+
+    listing="$(
+        uv run --quiet --no-project --with pyobjc-framework-Quartz \
+            python3 "$_PI_MSB_SCRIPT_DIR/capture_screenshots.py" --list
+    )" || {
+        echo "error: unable to list windows" >&2
+        return 1
+    }
+
+    while IFS=$'\t' read -r id owner title size; do
+        [[ -z "$id" ]] && continue
+        ids+=( "$id" )
+        labels+=( "$owner${title:+ - $title} ($size)" )
+    done <<< "$listing"
+
+    if (( ${#ids[@]} == 0 )); then
+        echo "error: no capturable windows found" >&2
+        echo "       (the terminal may need Screen Recording permission)" >&2
+        return 1
+    fi
+
+    echo "Select a window to share with the sandbox:" >&2
+    local i
+    for (( i = 0; i < ${#ids[@]}; i++ )); do
+        printf '  %2d) %s\n' "$(( i + 1 ))" "${labels[$i]}" >&2
+    done
+
+    while true; do
+        read -r -p "Window number (q to cancel): " choice < /dev/tty >&2 || return 1
+        [[ "$choice" == q ]] && return 1
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ids[@]} )); then
+            echo "Sharing: ${labels[$(( choice - 1 ))]}" >&2
+            printf '%s\n' "${ids[$(( choice - 1 ))]}"
+            return 0
+        fi
+        echo "Invalid choice" >&2
+    done
 }
 
 # ----------------------------------------------------------------
@@ -644,4 +822,4 @@ print("bedrock-api-key-" + base64.b64encode(url.encode()).decode())
 PY
 }
 
-pi-msb
+pi-msb "$@"
