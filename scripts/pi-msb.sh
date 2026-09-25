@@ -11,6 +11,23 @@ pi-msb() {
     local OPENAI_API_KEY=""
     local ANTHROPIC_API_KEY=""
     local ANTHROPIC_OAUTH_TOKEN=""
+    local AWS_BEARER_TOKEN_BEDROCK=""
+
+    # Bedrock settings (host side). The profile is used ONLY on the host
+    # to sign a short-term Bedrock API key; it never enters the sandbox.
+    local bedrock_profile="${PI_MSB_AWS_PROFILE:-pi-msb}"
+    local bedrock_region="${PI_MSB_AWS_REGION:-ap-southeast-2}"
+    local bedrock_expiry="${PI_MSB_BEDROCK_TOKEN_EXPIRY:-43200}"   # seconds, max 12h
+    local bedrock_enabled=0
+
+    # msb secret options for the Bedrock token. "body" works around an msb
+    # 0.7.3 bug where any '%' in a request body drops the connection when a
+    # header secret is substituted. Trade-off: placeholders in the body are
+    # also substituted, so the token could be echoed back into the sandbox.
+    # Acceptable here because the token is short-lived and Bedrock-scoped.
+    # Set PI_MSB_BEDROCK_SECRET_OPTS="" to use msb's default (headers only).
+    local bedrock_secret_opts="${PI_MSB_BEDROCK_SECRET_OPTS-body}"
+    local -a bedrock_env_args
 
 
     local -a secret_args
@@ -132,6 +149,46 @@ pi-msb() {
             secret_args+=(
                 --secret "ANTHROPIC_OAUTH_TOKEN@api.anthropic.com"
             )
+        fi
+    fi
+
+    # ------------------------------------------------------------
+    # Amazon Bedrock: mint a short-term bearer token (Bedrock API key)
+    # on the host from a dedicated AWS profile.
+    #
+    # SigV4 credentials cannot be used with msb secret placeholders
+    # (signing happens inside the guest), but a bearer token is sent
+    # verbatim in the Authorization header, so msb can substitute it.
+    # ------------------------------------------------------------
+
+    if [[ "${PI_MSB_BEDROCK:-1}" != "0" ]]; then
+        credential="$(_pi_msb_bedrock_token \
+            "$bedrock_profile" "$bedrock_region" "$bedrock_expiry")"
+
+        if [[ -n "$credential" ]]; then
+            AWS_BEARER_TOKEN_BEDROCK="$credential"
+            export AWS_BEARER_TOKEN_BEDROCK
+            bedrock_enabled=1
+
+            secret_args+=(
+                --secret "AWS_BEARER_TOKEN_BEDROCK${bedrock_secret_opts:+:$bedrock_secret_opts}@bedrock-runtime.${bedrock_region}.amazonaws.com"
+            )
+
+            # Non-secret config only. Token is region-bound, so the guest
+            # region must match the signing region.
+            bedrock_env_args+=(
+                --env "AWS_REGION=$bedrock_region"
+                --env "AWS_DEFAULT_REGION=$bedrock_region"
+            )
+
+            # The AWS SDK uses HTTP/2 for bedrock-runtime by default, which
+            # fails through msb's secret-substituting TLS proxy with
+            # "Protocol error". Force HTTP/1.1 unless explicitly disabled.
+            if [[ "${PI_MSB_BEDROCK_FORCE_HTTP1:-1}" == "1" ]]; then
+                bedrock_env_args+=( --env "AWS_BEDROCK_FORCE_HTTP1=1" )
+            fi
+
+            echo "Bedrock: short-term token minted from profile '$bedrock_profile' ($bedrock_region, ${bedrock_expiry}s)"
         fi
     fi
 
@@ -263,6 +320,29 @@ pi-msb() {
     # Refresh/add secrets every time pi-msb runs.
     # ------------------------------------------------------------
 
+    # Changing secret substitution options (e.g. adding :body) is reported
+    # by msb as a "live" change, but the proxy only picks it up after a full
+    # restart (`msb modify --restart` is not enough). Detect a mismatch now,
+    # before modifying, so we know whether to restart afterwards.
+    local bedrock_needs_restart=0
+
+    if (( bedrock_enabled )) && command -v jq >/dev/null 2>&1; then
+        local want_body=false current_body
+        [[ ",$bedrock_secret_opts," == *",body,"* ]] && want_body=true
+
+        current_body="$(
+            msb inspect "$name" --format json 2>/dev/null |
+                jq -r '[.. | objects
+                        | select(.env_var? == "AWS_BEARER_TOKEN_BEDROCK")
+                        | .substitution.body][0]
+                       | if . == null then "absent" else tostring end'
+        )"
+
+        if [[ "$current_body" != "absent" && "$current_body" != "$want_body" ]]; then
+            bedrock_needs_restart=1
+        fi
+    fi
+
     if (( ${#secret_args[@]} > 0 )); then
         msb modify \
             "$name" \
@@ -270,6 +350,12 @@ pi-msb() {
             --restart \
             >/dev/null \
         || return 1
+    fi
+
+    if (( bedrock_needs_restart )); then
+        echo "Bedrock secret options changed; restarting sandbox $name to apply"
+        echo "  (this terminates any other Pi sessions running in it)"
+        msb restart "$name" >/dev/null || return 1
     fi
 
     # ------------------------------------------------------------
@@ -315,6 +401,7 @@ pi-msb() {
             # without the misleading warning.
             useradd \
                 -K UID_MIN=0 \
+                -K UID_MAX=4294967294 \
                 --create-home \
                 --uid "$uid" \
                 --gid "$gid" \
@@ -448,6 +535,29 @@ pi-msb() {
     # Launch Pi.
     # ------------------------------------------------------------
 
+    # Default to a Bedrock model when Bedrock is enabled and the caller
+    # did not choose a provider/model. AU inference profiles are not in
+    # Pi's catalog, so they must be passed explicitly.
+    #   PI_MSB_BEDROCK_MODEL=""  -> don't inject a default model
+    local -a pi_args
+    local arg model_chosen=0
+    local bedrock_model="${PI_MSB_BEDROCK_MODEL-au.anthropic.claude-opus-5-5}"
+
+    for arg in "$@"; do
+        case "$arg" in
+            --provider|--provider=*|--model|--model=*|--models|--models=*)
+                model_chosen=1
+                ;;
+        esac
+    done
+
+    if (( bedrock_enabled )) && (( ! model_chosen )) && [[ -n "$bedrock_model" ]]; then
+        pi_args+=( --provider amazon-bedrock --model "$bedrock_model" )
+        echo "Default model: amazon-bedrock/$bedrock_model"
+    fi
+
+    pi_args+=( "$@" )
+
     echo "Starting Pi in sandbox $name as $guest_user ($host_uid:$host_gid)"
 
     msb exec \
@@ -460,7 +570,78 @@ pi-msb() {
         --env "GIT_AUTHOR_EMAIL=$git_user_email" \
         --env "GIT_COMMITTER_NAME=$git_user_name" \
         --env "GIT_COMMITTER_EMAIL=$git_user_email" \
+        "${bedrock_env_args[@]}" \
         --workdir /workspace \
         "$name" \
-        -- bash -lc "exec pi"
+        -- bash -lc 'exec pi "$@"' pi "${pi_args[@]}"
 }
+
+# ----------------------------------------------------------------
+# Print a short-term Amazon Bedrock API key (bearer token) signed with
+# credentials from the given AWS profile. Prints nothing on failure
+# (e.g. profile missing), so Bedrock is simply not enabled.
+#
+# Equivalent to AWS's aws-bedrock-token-generator: a SigV4 presigned
+# CallWithBearerToken URL, base64 encoded, prefixed "bedrock-api-key-".
+# Lifetime is min(expiry, remaining lifetime of the signing creds).
+#
+# Usage: _pi_msb_bedrock_token PROFILE REGION EXPIRY_SECONDS
+# ----------------------------------------------------------------
+_pi_msb_bedrock_token() {
+    local profile="$1" region="$2" expiry="$3"
+
+    command -v uv >/dev/null 2>&1 || {
+        echo "Bedrock: skipped (uv not found; needed to sign token)" >&2
+        return 0
+    }
+
+    # Run in a clean-ish env: ignore ambient AWS credentials so only the
+    # dedicated profile is ever used.
+    env -u AWS_ACCESS_KEY_ID \
+        -u AWS_SECRET_ACCESS_KEY \
+        -u AWS_SESSION_TOKEN \
+        -u AWS_BEARER_TOKEN_BEDROCK \
+        AWS_PROFILE="$profile" \
+        uv run --quiet --no-project --with botocore python3 - \
+            "$profile" "$region" "$expiry" <<'PY'
+import base64, sys
+from botocore.session import Session
+from botocore.exceptions import ProfileNotFound, BotoCoreError
+from botocore.auth import SigV4QueryAuth
+from botocore.awsrequest import AWSRequest
+
+profile, region, expiry = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+try:
+    creds = Session(profile=profile).get_credentials()
+except ProfileNotFound:
+    print(f"Bedrock: skipped (AWS profile '{profile}' not found)", file=sys.stderr)
+    sys.exit(0)
+except BotoCoreError as e:
+    print(f"Bedrock: skipped ({e})", file=sys.stderr)
+    sys.exit(0)
+
+if creds is None:
+    print(f"Bedrock: skipped (no credentials for profile '{profile}')", file=sys.stderr)
+    sys.exit(0)
+
+try:
+    creds = creds.get_frozen_credentials()
+except BotoCoreError as e:   # e.g. expired SSO session
+    print(f"Bedrock: skipped ({e})", file=sys.stderr)
+    sys.exit(0)
+
+req = AWSRequest(
+    method="POST",
+    url="https://bedrock.amazonaws.com/",
+    headers={"host": "bedrock.amazonaws.com"},
+    params={"Action": "CallWithBearerToken"},
+)
+SigV4QueryAuth(creds, "bedrock", region, expires=expiry).add_auth(req)
+
+url = req.url.replace("https://", "", 1) + "&Version=1"
+print("bedrock-api-key-" + base64.b64encode(url.encode()).decode())
+PY
+}
+
+pi-msb
