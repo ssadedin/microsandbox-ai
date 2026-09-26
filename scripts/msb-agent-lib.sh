@@ -211,20 +211,74 @@ _msb_agent_repo_hosts() {
 }
 
 # ----------------------------------------------------------------
-# Print the msb-agent-net label of sandbox NAME: the network policy it
-# was created with. Sandboxes from before this label existed were
-# always created with an open network, so an unlabelled one is "open".
-# Prints nothing if it can't be determined (no jq, unknown format).
+# Print label KEY of sandbox NAME, or DEFAULT if it has none (it was
+# created before the label existed). Prints nothing if it can't be
+# determined (no jq, unknown format).
+#
+# Usage: _msb_agent_label NAME KEY DEFAULT
 # ----------------------------------------------------------------
-_msb_agent_net_label() {
+_msb_agent_label() {
     command -v jq >/dev/null 2>&1 || return 0
 
     msb inspect "$1" --format json 2>/dev/null \
-    | jq -r '
-        ( [.. | objects | select(has("msb-agent-net")) | .["msb-agent-net"]]
-          + [.. | strings | select(startswith("msb-agent-net="))
-                | ltrimstr("msb-agent-net=")] )[0]
-        // "open"' 2>/dev/null
+    | jq -r --arg key "$2" --arg default "$3" '
+        ( [.. | objects | select(has($key)) | .[$key]]
+          + [.. | strings | select(startswith($key + "="))
+                | ltrimstr($key + "=")] )[0]
+        // $default' 2>/dev/null
+}
+
+# ----------------------------------------------------------------
+# .env files created by seeding (see msb_agent_run) are recorded by
+# inode in a host-only state directory the sandbox can't reach, so a
+# later sandbox for the same checkout can tell the agent's own .env
+# from a real one. Anything else, including a .env the agent replaced
+# rather than edited, counts as real (fail closed).
+# ----------------------------------------------------------------
+_msb_agent_env_marker() {
+    printf '%s/seeded-env/%s' \
+        "${XDG_STATE_HOME:-$HOME/.local/state}/msb-agent" \
+        "$(printf '%s' "$1" | _msb_agent_sha256)"
+}
+
+_msb_agent_inode() {
+    ls -di "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# True if DIR/.env exists and was not created by seeding.
+_msb_agent_has_real_env() {
+    local env="$1/.env" marker
+
+    [[ -e "$env" || -L "$env" ]] || return 1
+    [[ -L "$env" ]] && return 0
+
+    marker="$(_msb_agent_env_marker "$1")"
+    [[ -f "$marker" && "$(< "$marker")" == "$(_msb_agent_inode "$env")" ]] && return 1
+
+    return 0
+}
+
+# Create DIR/.env from the first existing SEED file and record it.
+# Usage: _msb_agent_seed_env DIR SEED...
+_msb_agent_seed_env() {
+    local dir="$1" seed marker
+    shift
+
+    [[ -e "$dir/.env" || -L "$dir/.env" ]] && return 0
+
+    for seed in "$@"; do
+        [[ -f "$seed" ]] || continue
+
+        ( umask 077 && cp "$seed" "$dir/.env" ) || return 1
+
+        marker="$(_msb_agent_env_marker "$dir")"
+        mkdir -p "$(dirname "$marker")" \
+        && _msb_agent_inode "$dir/.env" > "$marker" \
+        || return 1
+
+        echo "Created .env from $seed"
+        return 0
+    done
 }
 
 # ----------------------------------------------------------------
@@ -248,6 +302,27 @@ msb_agent_add_secret() {
     secret_args+=( --secret "${var}${opts:+:$opts}@${host}" )
     secret_specs+=( "$var|$opts" )
     net_allow+=( "$host" )
+}
+
+# ----------------------------------------------------------------
+# Prepare .env for a sandbox about to be created, per env_mode (see
+# msb_agent_run): seed a writable .env, or make sure .env.agent exists
+# and set env_mount_spec to mount it read-only over the real one.
+# ----------------------------------------------------------------
+_msb_agent_prepare_env() {
+    env_mount_spec=""
+
+    if [[ "$env_mode" == writable ]]; then
+        _msb_agent_seed_env "$dir" "${env_seeds[@]}"
+        return
+    fi
+
+    if [[ ! -e "$dir/.env.agent" ]]; then
+        touch "$dir/.env.agent" || return 1
+        echo "Created empty .env.agent"
+    fi
+
+    env_mount_spec="$dir/.env.agent:/workspace/.env:ro,uid=$host_uid,gid=$host_gid,host-perms=private"
 }
 
 msb_agent_run() {
@@ -370,18 +445,6 @@ msb_agent_run() {
     )" || true
 
     # ------------------------------------------------------------
-    # Always hide the real .env.
-    #
-    # If .env.agent is absent, create an empty file and mount that
-    # over /workspace/.env.
-    # ------------------------------------------------------------
-
-    if [[ ! -e "$dir/.env.agent" ]]; then
-        touch "$dir/.env.agent" || return 1
-        echo "Created empty .env.agent"
-    fi
-
-    # ------------------------------------------------------------
     # Resolve credentials on the host (agent specific).
     # ------------------------------------------------------------
 
@@ -481,6 +544,28 @@ msb_agent_run() {
     fi
 
     # ------------------------------------------------------------
+    # .env handling. Decided when a sandbox is created (mounts can't
+    # change later) and recorded in the msb-agent-env label:
+    #
+    #   writable  No real .env in the checkout (e.g. a linked worktree):
+    #             .env is seeded from .env.agent (this checkout's, else
+    #             the primary checkout's) and the agent may edit it.
+    #   squashed  A real .env exists: .env.agent is mounted read-only
+    #             over it. The real file is still inside the mounted
+    #             checkout, where root in the guest can reach it.
+    # ------------------------------------------------------------
+
+    local env_mode=writable
+    local -a env_seeds=( "$dir/.env.agent" )
+    local env_mount_spec=""
+
+    [[ -n "$primary" ]] && env_seeds+=( "$primary/.env.agent" )
+
+    if _msb_agent_has_real_env "$dir"; then
+        env_mode=squashed
+    fi
+
+    # ------------------------------------------------------------
     # Reuse an existing sandbox, clone the primary worktree VM disk
     # into a fresh sandbox for linked worktrees, or create from scratch.
     #
@@ -493,7 +578,16 @@ msb_agent_run() {
         echo "Using existing sandbox: $name"
 
         local have_label
-        have_label="$(_msb_agent_net_label "$name")"
+        have_label="$(_msb_agent_label "$name" msb-agent-net open)"
+
+        # Sandboxes from before the label always squashed .env.
+        env_mode="$(_msb_agent_label "$name" msb-agent-env squashed)"
+        env_mode="${env_mode:-squashed}"
+
+        if [[ "$env_mode" == squashed && ! -e "$dir/.env.agent" ]]; then
+            touch "$dir/.env.agent" || return 1
+            echo "Created empty .env.agent"
+        fi
 
         if [[ -n "$have_label" && "$have_label" != "$net_label" ]]; then
             net_policy_current=0
@@ -534,6 +628,8 @@ msb_agent_run() {
 
         echo "Restoring environment for worktree..."
 
+        _msb_agent_prepare_env || return 1
+
         local -a restore_mounts=()
         if [[ -d "$dir/.msb-agent" ]]; then
             restore_mounts=(
@@ -548,7 +644,7 @@ msb_agent_run() {
             --memory 8G \
             -v "$dir:/workspace:uid=$host_uid,gid=$host_gid,host-perms=private" \
             -v "$git_common:$git_common:uid=$host_uid,gid=$host_gid,host-perms=private" \
-            -v "$dir/.env.agent:/workspace/.env:ro,uid=$host_uid,gid=$host_gid,host-perms=private" \
+            ${env_mount_spec:+-v "$env_mount_spec"} \
             "${restore_mounts[@]}" \
             "${net_restore_args[@]}"
         then
@@ -558,8 +654,11 @@ msb_agent_run() {
 
         rm -rf "$tmpdir"
 
-        msb modify "$name" --label "msb-agent-net=$net_label" >/dev/null \
-        || echo "warning: could not label sandbox $name with its network policy" >&2
+        msb modify "$name" \
+            --label "msb-agent-net=$net_label" \
+            --label "msb-agent-env=$env_mode" \
+            >/dev/null \
+        || echo "warning: could not label sandbox $name" >&2
 
     else
 
@@ -579,10 +678,11 @@ msb_agent_run() {
             )
         fi
 
-        create_mounts+=(
-            --mount-file
-            "$dir/.env.agent:/workspace/.env:ro,uid=$host_uid,gid=$host_gid,host-perms=private"
-        )
+        _msb_agent_prepare_env || return 1
+
+        if [[ -n "$env_mount_spec" ]]; then
+            create_mounts+=( --mount-file "$env_mount_spec" )
+        fi
 
         if [[ -d "$dir/.msb-agent" ]]; then
             create_mounts+=(
@@ -599,11 +699,31 @@ msb_agent_run() {
             --workdir /workspace \
             "${net_create_args[@]}" \
             --label "msb-agent-net=$net_label" \
+            --label "msb-agent-env=$env_mode" \
             --trust-host-cas \
             "${secret_args[@]}" \
             "${create_mounts[@]}" \
             node:22-bookworm \
         || return 1
+    fi
+
+    if _msb_agent_has_real_env "$dir"; then
+        if [[ "$env_mode" == squashed ]]; then
+            {
+                echo "warning: $dir/.env exists. The agent sees .env.agent (read-only)"
+                echo "         at /workspace/.env instead, but the real file is still in the"
+                echo "         mounted checkout, where root in the sandbox (the agent has sudo)"
+                echo "         can reach it. To keep it out of reach, run agents in a linked"
+                echo "         worktree (git worktree add), which gets its own writable .env"
+                echo "         seeded from .env.agent."
+            } >&2
+        else
+            {
+                echo "warning: $dir/.env was not created by this tool, and this sandbox"
+                echo "         doesn't hide .env: the agent can read it. Remove it, or recreate"
+                echo "         the sandbox (msb rm $name) to mount .env.agent over it."
+            } >&2
+        fi
     fi
 
     # ------------------------------------------------------------
@@ -913,6 +1033,12 @@ msb_agent_run() {
         echo "Screenshot capture started (PID: $screenshot_pid, log: $shot_log)"
 
         extra_system_prompt+=$'\n\n'"A live screenshot of the user's application window ($screenshot_window) is available at $guest_shot. It is refreshed every $screenshot_interval seconds from the host. Use the read tool on that file whenever you need to see the current state of the UI (e.g. after making a change, wait a few seconds and read it again)."
+    fi
+
+    if [[ "$env_mode" == squashed ]]; then
+        extra_system_prompt+=$'\n\n'"/workspace/.env is a read-only stand-in for the project's real .env (the host's .env.agent). If it needs changes, tell the user what to change rather than working around it."
+    else
+        extra_system_prompt+=$'\n\n'"/workspace/.env (if present) is this sandbox's own copy, seeded from .env.agent; you may edit it. Edit it in place rather than replacing it with a new file."
     fi
 
     if [[ "$net_mode" == allowlist ]] && (( net_policy_current )); then
