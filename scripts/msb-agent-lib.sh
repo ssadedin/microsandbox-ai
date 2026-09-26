@@ -117,6 +117,99 @@ msb_agent_allow_host() {
     net_allow+=( "$@" )
 }
 
+_MSB_AGENT_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/msb-agent"
+
+# ----------------------------------------------------------------
+# Print the hosts listed in FILE (or, with -s, in the string STRING),
+# one per line, sorted and de-duplicated. Entries are separated by
+# whitespace or commas; "#" starts a comment. Each entry must be a
+# hostname or "*.suffix" with at least two labels, so a file can't
+# inject other msb rule syntax (groups such as "any", IPs, ports).
+# Invalid entries are reported on stderr and skipped.
+# ----------------------------------------------------------------
+_msb_agent_parse_hosts() {
+    local source text entry
+    local re='^(\*\.)?[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+
+    if [[ "$1" == -s ]]; then
+        text="$2"
+        source="MSB_AGENT_NET_ALLOW"
+    else
+        [[ -r "$1" ]] || return 0
+        text="$(< "$1")"
+        source="$1"
+    fi
+
+    printf '%s\n' "$text" \
+    | sed 's/#.*//' \
+    | tr ', \t' '\n\n\n' \
+    | sed '/^$/d' \
+    | while IFS= read -r entry; do
+        # The last label must not be numeric: no IP addresses.
+        if [[ "$entry" =~ $re && ! "${entry##*.}" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' "$entry" | tr 'A-Z' 'a-z'
+        else
+            echo "warning: ignoring invalid host '$entry' in $source" >&2
+        fi
+    done \
+    | sort -u
+}
+
+_msb_agent_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | cut -d' ' -f1
+    else
+        shasum -a 256 | cut -d' ' -f1
+    fi
+}
+
+# ----------------------------------------------------------------
+# Print the hosts from the repo's .msb-agent/allowed-hosts if the user
+# has approved them. The file is committed and can be changed by
+# anyone who can change the repo (including the agent, via git), so
+# its host list is approved on the host, direnv-style: approvals are
+# stored by content hash, and any change asks again. Without a
+# terminal, unapproved hosts are left out.
+# ----------------------------------------------------------------
+_msb_agent_repo_hosts() {
+    local file="$1/.msb-agent/allowed-hosts"
+    local hosts hash approved answer
+
+    hosts="$(_msb_agent_parse_hosts "$file")"
+    [[ -n "$hosts" ]] || return 0
+
+    hash="$(printf '%s\n' "$hosts" | _msb_agent_sha256)"
+    approved="$_MSB_AGENT_CONFIG_DIR/approved-hosts/$hash"
+
+    if [[ -f "$approved" ]]; then
+        printf '%s\n' "$hosts"
+        return 0
+    fi
+
+    {
+        echo "This repository's .msb-agent/allowed-hosts asks for network access to:"
+        printf '%s\n' "$hosts" | sed 's/^/    /'
+    } >&2
+
+    if [[ ! -t 0 ]]; then
+        echo "Not approved (no terminal to ask); using the default allowlist only." >&2
+        return 0
+    fi
+
+    read -r -p "Allow the sandbox to reach these hosts? [y/N] " answer || answer=""
+
+    if [[ ! "$answer" =~ ^[Yy] ]]; then
+        echo "Not approved; using the default allowlist only." >&2
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$approved")" \
+    && { echo "# approved for $1 on $(date)"; printf '%s\n' "$hosts"; } > "$approved" \
+    || echo "warning: could not record approval in $approved" >&2
+
+    printf '%s\n' "$hosts"
+}
+
 # ----------------------------------------------------------------
 # Print the msb-agent-net label of sandbox NAME: the network policy it
 # was created with. Sandboxes from before this label existed were
@@ -301,7 +394,11 @@ msb_agent_run() {
     #
     #   MSB_AGENT_NET=allowlist (default)  deny all but the allowlist
     #   MSB_AGENT_NET=open                 unrestricted public network
-    #   MSB_AGENT_NET_ALLOW="a.com,*.b.com"  extra allowed hosts
+    #
+    # The allowlist is the defaults plus hosts from:
+    #   ~/.config/msb-agent/allowed-hosts   personal, always trusted
+    #   MSB_AGENT_NET_ALLOW="a.com,*.b.com"
+    #   <repo>/.msb-agent/allowed-hosts     committed; needs approval
     # ------------------------------------------------------------
 
     local net_mode="${MSB_AGENT_NET:-allowlist}"
@@ -314,14 +411,17 @@ msb_agent_run() {
             net_create_args=( --net public )
             ;;
         allowlist)
-            local -a net_extra
-            local h
+            local h repo_hosts
 
-            IFS=', ' read -r -a net_extra <<< "${MSB_AGENT_NET_ALLOW:-}"
+            repo_hosts="$(_msb_agent_repo_hosts "$dir")"
+
             net_hosts="$(
-                printf '%s\n' "${_MSB_AGENT_NET_ALLOW_DEFAULT[@]}" \
-                    "${net_allow[@]}" "${net_extra[@]}" \
-                | sed '/^$/d' | sort -u
+                {
+                    printf '%s\n' "${_MSB_AGENT_NET_ALLOW_DEFAULT[@]}" "${net_allow[@]}"
+                    _msb_agent_parse_hosts "$_MSB_AGENT_CONFIG_DIR/allowed-hosts"
+                    _msb_agent_parse_hosts -s "${MSB_AGENT_NET_ALLOW:-}"
+                    printf '%s\n' "$repo_hosts"
+                } | sed '/^$/d' | sort -u
             )"
 
             net_rules="allow@dns"
@@ -434,6 +534,13 @@ msb_agent_run() {
 
         echo "Restoring environment for worktree..."
 
+        local -a restore_mounts=()
+        if [[ -d "$dir/.msb-agent" ]]; then
+            restore_mounts=(
+                -v "$dir/.msb-agent:/workspace/.msb-agent:ro,uid=$host_uid,gid=$host_gid,host-perms=private"
+            )
+        fi
+
         if ! msb snap restore \
             "$snap" \
             --name "$name" \
@@ -442,6 +549,7 @@ msb_agent_run() {
             -v "$dir:/workspace:uid=$host_uid,gid=$host_gid,host-perms=private" \
             -v "$git_common:$git_common:uid=$host_uid,gid=$host_gid,host-perms=private" \
             -v "$dir/.env.agent:/workspace/.env:ro,uid=$host_uid,gid=$host_gid,host-perms=private" \
+            "${restore_mounts[@]}" \
             "${net_restore_args[@]}"
         then
             rm -rf "$tmpdir"
@@ -475,6 +583,13 @@ msb_agent_run() {
             --mount-file
             "$dir/.env.agent:/workspace/.env:ro,uid=$host_uid,gid=$host_gid,host-perms=private"
         )
+
+        if [[ -d "$dir/.msb-agent" ]]; then
+            create_mounts+=(
+                --mount-dir
+                "$dir/.msb-agent:/workspace/.msb-agent:ro,uid=$host_uid,gid=$host_gid,host-perms=private"
+            )
+        fi
 
         msb create \
             --name "$name" \
@@ -801,7 +916,7 @@ msb_agent_run() {
     fi
 
     if [[ "$net_mode" == allowlist ]] && (( net_policy_current )); then
-        extra_system_prompt+=$'\n\n'"Outbound network access is restricted to these hosts (\"*.x\" includes x and its subdomains): $(printf '%s\n' "$net_hosts" | paste -sd, - | sed 's/,/, /g'). Connections to anything else are refused. GitHub has no credentials here, so it is read-only (clone, fetch, downloads). If a task needs another host, do not try to work around the restriction: tell the user which host is needed and why, so they can add it with MSB_AGENT_NET_ALLOW (which requires recreating the sandbox)."
+        extra_system_prompt+=$'\n\n'"Outbound network access is restricted to these hosts (\"*.x\" includes x and its subdomains): $(printf '%s\n' "$net_hosts" | paste -sd, - | sed 's/,/, /g'). Connections to anything else are refused. GitHub has no credentials here, so it is read-only (clone, fetch, downloads). If a task needs another host, do not try to work around the restriction or edit the allowlist yourself (it is read-only and changes need the user's approval): tell the user which host is needed and why, and suggest the exact line to add to .msb-agent/allowed-hosts in the repository (one host or \"*.domain\" per line). The change takes effect when the sandbox is recreated."
     fi
 
     # ------------------------------------------------------------
