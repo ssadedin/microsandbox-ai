@@ -50,6 +50,15 @@ claude_msb_credentials() {
     else
         msb_agent_add_secret CLAUDE_CODE_OAUTH_TOKEN api.anthropic.com
     fi
+
+    # Installer and auto-updater downloads.
+    msb_agent_allow_host claude.ai downloads.claude.ai storage.googleapis.com
+
+    # Telemetry and error reporting hosts are not on the allowlist.
+    agent_env_args+=(
+        --env DISABLE_TELEMETRY=1
+        --env DISABLE_ERROR_REPORTING=1
+    )
 }
 
 # ----------------------------------------------------------------

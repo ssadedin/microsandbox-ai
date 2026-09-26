@@ -46,6 +46,94 @@ Never disable certificate verification. If you still cannot get a tool to connec
 EOF_PROMPT
 )"
 
+# Hosts the sandbox may reach when MSB_AGENT_NET=allowlist (the
+# default). Each secret's host is added automatically, agents add their
+# own with msb_agent_allow_host, and MSB_AGENT_NET_ALLOW adds more.
+#
+# msb can't change the policy of an existing sandbox, so this errs on
+# the side of covering routine package, toolchain and image downloads.
+# "*.example.com" matches example.com and all of its subdomains; it is
+# preferred so new download/CDN subdomains keep working.
+#
+# Deliberately excluded: general-purpose storage and file hosts (S3,
+# storage.googleapis.com, pastebins, ...), which accept anonymous
+# uploads to attacker-controlled buckets. Everything below only serves
+# downloads to a sandbox without credentials.
+_MSB_AGENT_NET_ALLOW_DEFAULT=(
+    # Debian packages
+    "*.debian.org"
+
+    # Git hosting. The sandbox has no credentials for these, so they
+    # are effectively read-only (clone, fetch, API reads, downloads).
+    "*.github.com" "*.githubusercontent.com" "*.github.io"
+    "*.gitlab.com" bitbucket.org
+
+    # Container registries (for docker/podman inside the sandbox; msb
+    # pulls the sandbox image itself on the host).
+    "*.docker.io" "*.docker.com"            # Docker Hub (incl. its blob CDN), download.docker.com
+    ghcr.io                                 # GitHub (blobs: *.githubusercontent.com)
+    "*.quay.io"                             # Quay (blobs: cdn*.quay.io)
+    "*.mcr.microsoft.com"                   # Microsoft (blobs: *.data.mcr.microsoft.com)
+    public.ecr.aws                          # AWS public gallery
+    gcr.io "*.gcr.io" "*.pkg.dev"           # Google / Artifact Registry
+    "*.k8s.io"                              # registry.k8s.io, dl.k8s.io
+
+    # Node / JavaScript
+    nodejs.org "*.npmjs.org" "*.npmjs.com" "*.yarnpkg.com"
+    get.pnpm.io bun.sh "*.jsr.io" deno.land dl.deno.land
+
+    # Python
+    pypi.org "*.python.org" "*.pythonhosted.org" bootstrap.pypa.io astral.sh
+    "*.anaconda.org" "*.anaconda.com"
+
+    # Java / JVM
+    "*.gradle.org"                          # services, downloads, plugins, plugins-artifacts
+    "*.maven.org" "*.apache.org"            # repo1.maven.org, repo.maven.apache.org, archive/downloads
+    maven.google.com dl.google.com          # Android / Google Maven, Go downloads
+    "*.adoptium.net" api.foojay.io          # Temurin JDKs, Gradle toolchain resolution
+    cdn.azul.com corretto.aws "*.sdkman.io"
+    repo.scala-sbt.org
+
+    # Go
+    go.dev "*.golang.org"                   # proxy / sum / index
+
+    # Rust
+    "*.rust-lang.org" "*.rustup.rs" "*.crates.io"
+
+    # Ruby, PHP, .NET
+    "*.rubygems.org"
+    getcomposer.org "*.packagist.org"
+    "*.nuget.org" dot.net builds.dotnet.microsoft.com
+
+    # Other routine tooling
+    cdn.playwright.dev playwright.download.prss.microsoft.com
+    releases.hashicorp.com registry.terraform.io get.helm.sh
+)
+
+# ----------------------------------------------------------------
+# Allow the sandbox to reach HOST... (see _MSB_AGENT_NET_ALLOW_DEFAULT).
+# ----------------------------------------------------------------
+msb_agent_allow_host() {
+    net_allow+=( "$@" )
+}
+
+# ----------------------------------------------------------------
+# Print the msb-agent-net label of sandbox NAME: the network policy it
+# was created with. Sandboxes from before this label existed were
+# always created with an open network, so an unlabelled one is "open".
+# Prints nothing if it can't be determined (no jq, unknown format).
+# ----------------------------------------------------------------
+_msb_agent_net_label() {
+    command -v jq >/dev/null 2>&1 || return 0
+
+    msb inspect "$1" --format json 2>/dev/null \
+    | jq -r '
+        ( [.. | objects | select(has("msb-agent-net")) | .["msb-agent-net"]]
+          + [.. | strings | select(startswith("msb-agent-net="))
+                | ltrimstr("msb-agent-net=")] )[0]
+        // "open"' 2>/dev/null
+}
+
 # ----------------------------------------------------------------
 # Register a host env var as an msb secret for HOST.
 #
@@ -66,6 +154,7 @@ msb_agent_add_secret() {
 
     secret_args+=( --secret "${var}${opts:+:$opts}@${host}" )
     secret_specs+=( "$var|$opts" )
+    net_allow+=( "$host" )
 }
 
 msb_agent_run() {
@@ -81,7 +170,7 @@ msb_agent_run() {
     local host_uid host_gid
     local guest_user guest_home
 
-    local -a secret_args secret_specs
+    local -a secret_args secret_specs net_allow
     local -a agent_env_args agent_args
     local -a create_mounts
     local agent_cmd="$agent"
@@ -206,6 +295,57 @@ msb_agent_run() {
     "${agent}_msb_credentials" || return 1
 
     # ------------------------------------------------------------
+    # Network policy. msb can't change it on an existing sandbox, so
+    # it is applied at create/restore and recorded in a label; a
+    # sandbox with a different policy gets a warning instead.
+    #
+    #   MSB_AGENT_NET=allowlist (default)  deny all but the allowlist
+    #   MSB_AGENT_NET=open                 unrestricted public network
+    #   MSB_AGENT_NET_ALLOW="a.com,*.b.com"  extra allowed hosts
+    # ------------------------------------------------------------
+
+    local net_mode="${MSB_AGENT_NET:-allowlist}"
+    local net_rules="" net_label net_hosts=""
+    local -a net_create_args net_restore_args
+
+    case "$net_mode" in
+        open)
+            net_label=open
+            net_create_args=( --net public )
+            ;;
+        allowlist)
+            local -a net_extra
+            local h
+
+            IFS=', ' read -r -a net_extra <<< "${MSB_AGENT_NET_ALLOW:-}"
+            net_hosts="$(
+                printf '%s\n' "${_MSB_AGENT_NET_ALLOW_DEFAULT[@]}" \
+                    "${net_allow[@]}" "${net_extra[@]}" \
+                | sed '/^$/d' | sort -u
+            )"
+
+            net_rules="allow@dns"
+            while IFS= read -r h; do
+                net_rules+=",allow@$h"
+            done <<< "$net_hosts"
+
+            net_label="allowlist-$(printf '%s' "$net_rules" | cksum | cut -d' ' -f1)"
+
+            # In strict mode (msb's default), hostname rules only admit
+            # HTTPS that msb can intercept, so interception must be on
+            # even when there are no secrets.
+            net_create_args=( --net-default deny --net-rule "$net_rules" --tls-intercept )
+            net_restore_args=( --net-default deny --net-rule "$net_rules" )
+            ;;
+        *)
+            echo "error: MSB_AGENT_NET must be 'allowlist' or 'open' (got '$net_mode')" >&2
+            return 1
+            ;;
+    esac
+
+    local net_policy_current=1
+
+    # ------------------------------------------------------------
     # Discover Git worktree layout.
     # ------------------------------------------------------------
 
@@ -252,6 +392,20 @@ msb_agent_run() {
 
         echo "Using existing sandbox: $name"
 
+        local have_label
+        have_label="$(_msb_agent_net_label "$name")"
+
+        if [[ -n "$have_label" && "$have_label" != "$net_label" ]]; then
+            net_policy_current=0
+            {
+                echo "warning: sandbox $name has a different network policy ($have_label)"
+                echo "         than requested ($net_label). msb can't change it in place;"
+                echo "         to apply it, remove the sandbox (installed packages are lost):"
+                echo "             msb rm $name"
+                echo "         or set MSB_AGENT_NET=open to use an unrestricted network."
+            } >&2
+        fi
+
     elif (( linked_worktree )) && \
          [[ -n "$source_name" ]] && \
          msb inspect "$source_name" >/dev/null 2>&1
@@ -287,13 +441,17 @@ msb_agent_run() {
             --memory 8G \
             -v "$dir:/workspace:uid=$host_uid,gid=$host_gid,host-perms=private" \
             -v "$git_common:$git_common:uid=$host_uid,gid=$host_gid,host-perms=private" \
-            -v "$dir/.env.agent:/workspace/.env:ro,uid=$host_uid,gid=$host_gid,host-perms=private"
+            -v "$dir/.env.agent:/workspace/.env:ro,uid=$host_uid,gid=$host_gid,host-perms=private" \
+            "${net_restore_args[@]}"
         then
             rm -rf "$tmpdir"
             return 1
         fi
 
         rm -rf "$tmpdir"
+
+        msb modify "$name" --label "msb-agent-net=$net_label" >/dev/null \
+        || echo "warning: could not label sandbox $name with its network policy" >&2
 
     else
 
@@ -324,7 +482,8 @@ msb_agent_run() {
             --memory 8G \
             --root-disk 20G \
             --workdir /workspace \
-            --net public \
+            "${net_create_args[@]}" \
+            --label "msb-agent-net=$net_label" \
             --trust-host-cas \
             "${secret_args[@]}" \
             "${create_mounts[@]}" \
@@ -639,6 +798,10 @@ msb_agent_run() {
         echo "Screenshot capture started (PID: $screenshot_pid, log: $shot_log)"
 
         extra_system_prompt+=$'\n\n'"A live screenshot of the user's application window ($screenshot_window) is available at $guest_shot. It is refreshed every $screenshot_interval seconds from the host. Use the read tool on that file whenever you need to see the current state of the UI (e.g. after making a change, wait a few seconds and read it again)."
+    fi
+
+    if [[ "$net_mode" == allowlist ]] && (( net_policy_current )); then
+        extra_system_prompt+=$'\n\n'"Outbound network access is restricted to these hosts (\"*.x\" includes x and its subdomains): $(printf '%s\n' "$net_hosts" | paste -sd, - | sed 's/,/, /g'). Connections to anything else are refused. GitHub has no credentials here, so it is read-only (clone, fetch, downloads). If a task needs another host, do not try to work around the restriction: tell the user which host is needed and why, so they can add it with MSB_AGENT_NET_ALLOW (which requires recreating the sandbox)."
     fi
 
     # ------------------------------------------------------------
