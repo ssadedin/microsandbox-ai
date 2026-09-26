@@ -26,10 +26,25 @@
 # variables of msb_agent_run: secret_args, secret_specs,
 # agent_env_args, agent_cmd, agent_args, extra_system_prompt,
 # name, dir, guest_user, guest_home.
+#
+# Entry scripts may set sandbox_prefix before calling msb_agent_run.
+# Sandboxes are named "<sandbox_prefix><project>", so agents with
+# different prefixes get separate sandboxes (and separate secrets).
 # ----------------------------------------------------------------
 
 # Directory containing this library (used to locate capture_screenshots.py).
 _MSB_AGENT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# Always appended to the agent's system prompt.
+_MSB_AGENT_ENV_PROMPT="$(cat <<'EOF_PROMPT'
+You are running inside a microsandbox VM (Debian, passwordless sudo). The project is mounted at /workspace. API credentials are placeholders that are replaced with real values by a proxy on the host; they are not usable secrets.
+
+Outbound HTTPS is intercepted by that proxy (TLS interception), so servers present certificates signed by the microsandbox CA at /.msb/tls/ca.pem. It is already in the system bundle /etc/ssl/certs/ca-certificates.crt, and SSL_CERT_FILE, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE and NODE_EXTRA_CA_CERTS point at it, so curl, git, Python, Node and Go work as usual. If a tool fails with a certificate error (PKIX path building failed, unable to get local issuer certificate, self-signed certificate in chain), make that tool trust the CA rather than giving up:
+- Java (Gradle, Maven, sbt, etc.): run `msb-trust-java`, which adds the CA to every JDK it finds. It runs automatically after apt installs; run it yourself after installing a JDK any other way (SDKMAN, tarballs, Gradle toolchains), then stop any running Gradle daemons (`./gradlew --stop`) and retry.
+- Other tools with their own CA list: point them at /etc/ssl/certs/ca-certificates.crt (e.g. `pip config set global.cert`, `npm config set cafile`, `DENO_CERT`, `GIT_SSL_CAINFO`, `AWS_CA_BUNDLE`) or add /.msb/tls/ca.pem to their trust store.
+Never disable certificate verification. If you still cannot get a tool to connect, stop and report the exact error and command instead of skipping the step.
+EOF_PROMPT
+)"
 
 # ----------------------------------------------------------------
 # Register a host env var as an msb secret for HOST.
@@ -38,10 +53,16 @@ _MSB_AGENT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # a placeholder, which msb substitutes on requests to HOST.
 #
 # Usage: msb_agent_add_secret VAR HOST [OPTS]
-#   OPTS: msb substitution options, e.g. "body"
+#   OPTS: msb secret options, e.g. "body". Defaults to
+#         "passthrough=HOST", which works around an msb 0.7.3 bug where
+#         any '%' in a request body drops the connection when a header
+#         secret is substituted (microsandbox#1664). Headers are still
+#         substituted and the body is passed through unchanged, so the
+#         real secret can never be echoed back into the sandbox. Pass ""
+#         for msb's default once a fixed msb is released.
 # ----------------------------------------------------------------
 msb_agent_add_secret() {
-    local var="$1" host="$2" opts="${3:-}"
+    local var="$1" host="$2" opts="${3-passthrough=$2}"
 
     secret_args+=( --secret "${var}${opts:+:$opts}@${host}" )
     secret_specs+=( "$var|$opts" )
@@ -64,7 +85,7 @@ msb_agent_run() {
     local -a agent_env_args agent_args
     local -a create_mounts
     local agent_cmd="$agent"
-    local extra_system_prompt=""
+    local extra_system_prompt="$_MSB_AGENT_ENV_PROMPT"
 
     # ------------------------------------------------------------
     # Parse common options; everything else goes to the agent.
@@ -153,7 +174,7 @@ msb_agent_run() {
         dir="$(pwd -P)"
     fi
 
-    name="$(basename "$dir")"
+    name="${sandbox_prefix:-}$(basename "$dir")"
 
     # Resolve the effective Git identity for this repository on the host.
     # This respects global config, repo-local overrides and includeIf rules
@@ -214,7 +235,7 @@ msb_agent_run() {
 
             if [[ -n "$primary" ]]; then
                 primary="$(cd "$primary" && pwd -P)"
-                source_name="$(basename "$primary")"
+                source_name="${sandbox_prefix:-}$(basename "$primary")"
             fi
         fi
     fi
@@ -223,7 +244,8 @@ msb_agent_run() {
     # Reuse an existing sandbox, clone the primary worktree VM disk
     # into a fresh sandbox for linked worktrees, or create from scratch.
     #
-    # The sandbox is per project, not per agent: all agents share it.
+    # The sandbox is per project and sandbox_prefix: agents that share a
+    # prefix share it.
     # ------------------------------------------------------------
 
     if msb inspect "$name" >/dev/null 2>&1; then
@@ -314,14 +336,16 @@ msb_agent_run() {
     # Refresh/add secrets every time we run.
     # ------------------------------------------------------------
 
-    # Changing secret substitution options (e.g. adding :body) is reported
-    # by msb as a "live" change, but the proxy only picks it up after a full
-    # restart (`msb modify --restart` is not enough). Detect a mismatch now,
-    # before modifying, so we know whether to restart afterwards.
+    # Changing secret options (e.g. body substitution or passthrough) is
+    # reported by msb as a "live" change, but the proxy only picks it up
+    # after a full restart (`msb modify --restart` is not enough). Detect
+    # a mismatch now, before modifying, so we know whether to restart
+    # afterwards.
     local needs_restart=0
 
     if (( ${#secret_specs[@]} > 0 )) && command -v jq >/dev/null 2>&1; then
-        local spec var opts want_body current_body sandbox_json
+        local spec var opts opt want_body sandbox_json
+        local -a opt_list want_passthrough
 
         sandbox_json="$(msb inspect "$name" --format json 2>/dev/null)"
 
@@ -330,18 +354,33 @@ msb_agent_run() {
             opts="${spec#*|}"
 
             want_body=false
-            [[ ",$opts," == *",body,"* ]] && want_body=true
+            want_passthrough=()
+            IFS=, read -r -a opt_list <<< "$opts"
+            for opt in "${opt_list[@]}"; do
+                case "$opt" in
+                    body) want_body=true ;;
+                    passthrough=*) want_passthrough+=( "${opt#passthrough=}" ) ;;
+                esac
+            done
 
-            current_body="$(
-                jq -r --arg var "$var" \
-                    '[.. | objects
-                      | select(.env_var? == $var)
-                      | .substitution.body][0]
-                     | if . == null then "absent" else tostring end' \
-                    <<< "$sandbox_json"
-            )"
-
-            if [[ -n "$current_body" && "$current_body" != "absent" && "$current_body" != "$want_body" ]]; then
+            # Only compare fields present in the inspect output; a secret
+            # that isn't there yet is added by the restart-backed modify.
+            if [[ "$(
+                printf '%s\n' "${want_passthrough[@]}" \
+                | jq -R -s -r \
+                    --arg var "$var" \
+                    --argjson body "$want_body" \
+                    --argjson sandbox "${sandbox_json:-null}" \
+                    '(split("\n") | map(select(. != "")) | sort) as $passthrough
+                     | [$sandbox | .. | objects | select(.env_var? == $var)][0] as $cur
+                     | if $cur == null then "same"
+                       elif ($cur.substitution.body != null
+                             and $cur.substitution.body != $body) then "changed"
+                       elif ($cur | has("passthrough"))
+                             and (($cur.passthrough // []) | sort) != $passthrough then "changed"
+                       else "same" end' \
+                    2>/dev/null
+            )" == changed ]]; then
                 needs_restart=1
             fi
         done
@@ -505,6 +544,29 @@ msb_agent_run() {
     || return 1
 
     # ------------------------------------------------------------
+    # Make Java trust the TLS interception CA (msb already covers the
+    # system store, curl, Python, Node etc.). Re-run after every apt
+    # install so JDKs installed by the agent are covered too.
+    # ------------------------------------------------------------
+
+    msb exec -q "$name" -- \
+        bash -c '
+            set -euo pipefail
+
+            printf "%s" "$1" > /usr/local/bin/msb-trust-java
+            chmod 0755 /usr/local/bin/msb-trust-java
+
+            printf "%s\n" \
+                "DPkg::Post-Invoke { \"/usr/local/bin/msb-trust-java -q || true\"; };" \
+                > /etc/apt/apt.conf.d/99msb-trust-java
+
+            /usr/local/bin/msb-trust-java
+        ' \
+        msb-trust-java-setup \
+        "$(< "$_MSB_AGENT_LIB_DIR/msb-trust-java.sh")" \
+    || echo "warning: could not set up Java trust for the TLS interception CA" >&2
+
+    # ------------------------------------------------------------
     # Install the agent (agent specific).
     # ------------------------------------------------------------
 
@@ -576,7 +638,7 @@ msb_agent_run() {
 
         echo "Screenshot capture started (PID: $screenshot_pid, log: $shot_log)"
 
-        extra_system_prompt="A live screenshot of the user's application window ($screenshot_window) is available at $guest_shot. It is refreshed every $screenshot_interval seconds from the host. Use the read tool on that file whenever you need to see the current state of the UI (e.g. after making a change, wait a few seconds and read it again)."
+        extra_system_prompt+=$'\n\n'"A live screenshot of the user's application window ($screenshot_window) is available at $guest_shot. It is refreshed every $screenshot_interval seconds from the host. Use the read tool on that file whenever you need to see the current state of the UI (e.g. after making a change, wait a few seconds and read it again)."
     fi
 
     # ------------------------------------------------------------

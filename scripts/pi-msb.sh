@@ -20,13 +20,6 @@ pi-msb() {
     local bedrock_expiry="${PI_MSB_BEDROCK_TOKEN_EXPIRY:-43200}"   # seconds, max 12h
     local bedrock_enabled=0
 
-    # msb secret options for the Bedrock token. "body" works around an msb
-    # 0.7.3 bug where any '%' in a request body drops the connection when a
-    # header secret is substituted. Trade-off: placeholders in the body are
-    # also substituted, so the token could be echoed back into the sandbox.
-    # Acceptable here because the token is short-lived and Bedrock-scoped.
-    # Set PI_MSB_BEDROCK_SECRET_OPTS="" to use msb's default (headers only).
-    local bedrock_secret_opts="${PI_MSB_BEDROCK_SECRET_OPTS-body}"
 
     msb_agent_run pi "$@"
 }
@@ -121,8 +114,7 @@ pi_msb_credentials() {
             bedrock_enabled=1
 
             msb_agent_add_secret AWS_BEARER_TOKEN_BEDROCK \
-                "bedrock-runtime.${bedrock_region}.amazonaws.com" \
-                "$bedrock_secret_opts"
+                "bedrock-runtime.${bedrock_region}.amazonaws.com"
 
             # Non-secret config only. Token is region-bound, so the guest
             # region must match the signing region.

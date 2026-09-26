@@ -9,7 +9,8 @@
 # Environment:
 #   CLAUDE_MSB_OAUTH_TOKEN      use this token instead of the stored one
 #   CLAUDE_MSB_SECRET_OPTS      msb secret options (default: passthrough
-#                               for api.anthropic.com, see below)
+#                               for api.anthropic.com, see
+#                               msb_agent_add_secret)
 #   CLAUDE_MSB_SKIP_PERMISSIONS=0   don't pass --dangerously-skip-permissions
 #   CLAUDE_MSB_SYNC             space separated ~/.claude entries to copy
 #                               into the sandbox on each launch
@@ -25,13 +26,10 @@ claude-msb() {
     # read it when creating/modifying the sandbox.
     local CLAUDE_CODE_OAUTH_TOKEN=""
 
-    # msb secret options. "passthrough" works around an msb 0.7.3 bug where
-    # any '%' in a request body drops the connection when a header secret is
-    # substituted (microsandbox#1664). Unlike "body", the body is passed
-    # through unchanged, so the (long-lived) token can never be substituted
-    # into a request and echoed back into the sandbox.
-    # Set CLAUDE_MSB_SECRET_OPTS="" once a fixed msb is released.
-    local claude_secret_opts="${CLAUDE_MSB_SECRET_OPTS-passthrough=api.anthropic.com}"
+    # Separate from pi-msb's sandbox (named after the project alone):
+    # msb re-resolves every secret on modify, so a shared sandbox needs
+    # every agent's host credentials.
+    local sandbox_prefix="claude-"
 
     msb_agent_run claude "$@"
 }
@@ -47,7 +45,11 @@ claude_msb_credentials() {
 
     export CLAUDE_CODE_OAUTH_TOKEN
 
-    msb_agent_add_secret CLAUDE_CODE_OAUTH_TOKEN api.anthropic.com "$claude_secret_opts"
+    if [[ -n "${CLAUDE_MSB_SECRET_OPTS+set}" ]]; then
+        msb_agent_add_secret CLAUDE_CODE_OAUTH_TOKEN api.anthropic.com "$CLAUDE_MSB_SECRET_OPTS"
+    else
+        msb_agent_add_secret CLAUDE_CODE_OAUTH_TOKEN api.anthropic.com
+    fi
 }
 
 # ----------------------------------------------------------------
