@@ -796,6 +796,26 @@ msb_agent_run() {
     fi
 
     # ------------------------------------------------------------
+    # Wait for outbound networking. For a few seconds after msb creates
+    # or restarts a sandbox, connections to allowlisted hosts can be
+    # refused even though DNS works, which breaks the installs below.
+    # ------------------------------------------------------------
+
+    local probe_url="${MSB_AGENT_NET_PROBE:-http://deb.debian.org/}"
+
+    msb exec -q "$name" -- \
+        bash -c '
+            for i in $(seq 1 30); do
+                curl -fsS -o /dev/null --max-time 5 "$1" 2>/dev/null && exit 0
+                sleep 1
+            done
+            exit 1
+        ' \
+        msb-agent-net-wait \
+        "$probe_url" \
+    || echo "warning: sandbox can't reach $probe_url after 30s; continuing anyway" >&2
+
+    # ------------------------------------------------------------
     # Create a matching guest user if needed.
     #
     # Do NOT capture the output of useradd/groupadd: tools may emit
@@ -924,7 +944,14 @@ msb_agent_run() {
 
                 export DEBIAN_FRONTEND=noninteractive
 
-                apt-get update
+                # --error-on=any: fail (and retry) on fetch errors,
+                # which apt otherwise only warns about.
+                for attempt in 1 2 3; do
+                    apt-get update --error-on=any && break
+                    (( attempt < 3 )) || exit 1
+                    sleep 3
+                done
+
                 apt-get install -y sudo
             fi
 
