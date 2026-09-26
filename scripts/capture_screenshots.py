@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-Continuously capture a screenshot of a single macOS window.
+Capture screenshots of a single, pre-approved macOS window on request.
 
 Usage:
     capture_screenshots.py --list
-    capture_screenshots.py [options] WINDOW
+    capture_screenshots.py [options] --dir DIR WINDOW
 
 WINDOW is either a numeric CoreGraphics window id, or a case-insensitive
 substring matched against "<owner app> - <window title>". The first
 (front-most) matching on-screen window is used.
 
-The screenshot is written atomically (temp file + rename) so a reader
-never sees a partially written image.
+Requests arrive as files: a client creates DIR/screenshot-requests/ID.req
+and waits. The window is captured to DIR/screenshot.png (written
+atomically), then ID.done is written containing the image file name, or
+ID.err containing an error message. Request contents are ignored: the
+client cannot choose what is captured. Captures are rate limited, and the
+window must still belong to the app that owned it at startup; if it
+disappears, only a window of the same app matching WINDOW is re-attached.
 
 Requires pyobjc-framework-Quartz, e.g.:
     uv run --with pyobjc-framework-Quartz capture_screenshots.py --list
@@ -22,6 +27,7 @@ The terminal running this needs the macOS "Screen Recording" permission
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -48,6 +54,7 @@ def list_windows():
         windows.append({
             "id": int(w[Quartz.kCGWindowNumber]),
             "owner": str(w.get(Quartz.kCGWindowOwnerName) or ""),
+            "pid": int(w.get(Quartz.kCGWindowOwnerPID) or 0),
             "title": str(w.get(Quartz.kCGWindowName) or ""),
             "width": width,
             "height": height,
@@ -153,15 +160,53 @@ def parent_alive(pid):
         return True
 
 
+REQUEST_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}\.req$")
+MAX_REQUESTS = 20
+
+
+def resolve(spec, window):
+    """Return the approved window's current info, or None.
+
+    Accepts the same window id if it still belongs to the same app;
+    otherwise re-resolves spec, but only to a window of the same app.
+    """
+    windows = list_windows()
+    same = next((w for w in windows if w["id"] == window["id"]), None)
+    if same is not None and same["owner"] == window["owner"]:
+        return same
+    if spec.isdigit():
+        return None
+    needle = spec.lower()
+    return next((w for w in windows
+                 if w["owner"] == window["owner"]
+                 and needle in describe(w).lower()), None)
+
+
+def reply(req_dir, req, suffix, text):
+    """Answer request file req with ID.done / ID.err, then remove it."""
+    base = req[:-len(".req")]
+    tmp = os.path.join(req_dir, f".{base}{suffix}.tmp")
+    with open(tmp, "w") as f:
+        f.write(text + "\n")
+    os.replace(tmp, os.path.join(req_dir, base + suffix))
+    try:
+        os.unlink(os.path.join(req_dir, req))
+    except FileNotFoundError:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("window", nargs="?", help="window id or name substring")
     ap.add_argument("--list", action="store_true",
                     help="list capturable windows as TSV: id, owner, title, WxH")
-    ap.add_argument("-o", "--output", default="screenshot.png")
-    ap.add_argument("-i", "--interval", type=float, default=2.0,
-                    help="seconds between captures (default 2)")
+    ap.add_argument("-d", "--dir",
+                    help="directory for screenshot.png and screenshot-requests/")
+    ap.add_argument("--min-interval", type=float, default=1.0,
+                    help="minimum seconds between captures (default 1)")
+    ap.add_argument("--poll", type=float, default=0.2,
+                    help="seconds between checks for requests (default 0.2)")
     ap.add_argument("--max-size", type=int, default=1600,
                     help="max width/height in pixels, 0 = no scaling (default 1600)")
     ap.add_argument("--parent-pid", type=int, default=0,
@@ -173,37 +218,75 @@ def main():
             print(f"{w['id']}\t{w['owner']}\t{w['title']}\t{w['width']}x{w['height']}")
         return 0
 
-    if not args.window:
-        ap.error("WINDOW is required unless --list is given")
+    if not args.window or not args.dir:
+        ap.error("WINDOW and --dir are required unless --list is given")
 
     window = find_window(args.window)
     if window is None:
         print(f"error: no on-screen window matching '{args.window}'", file=sys.stderr)
         return 1
 
-    print(f"Capturing window {window['id']}: {describe(window)} -> {args.output}",
-          flush=True)
+    output = os.path.join(args.dir, "screenshot.png")
+    req_dir = os.path.join(args.dir, "screenshot-requests")
+    os.makedirs(req_dir, exist_ok=True)
 
-    last_error = None
+    # Check permissions etc. now, without publishing anything.
+    with tempfile.TemporaryDirectory(prefix="msb-shot-check-") as tmp:
+        try:
+            capture(window["id"], os.path.join(tmp, "check.png"), args.max_size)
+        except Exception as e:
+            print(f"error: test capture failed: {e}", file=sys.stderr)
+            return 1
+
+    print(f"Ready: capturing window {window['id']} ({describe(window)}) "
+          f"on request -> {output}", flush=True)
+
+    last_capture = 0.0
     while parent_alive(args.parent_pid):
         try:
-            capture(window["id"], args.output, args.max_size)
-            if last_error:
-                print("capture recovered", flush=True)
-            last_error = None
-        except Exception as e:  # keep going: window may be minimised etc.
-            msg = str(e)
-            if msg != last_error:
-                print(f"capture failed: {msg}", file=sys.stderr, flush=True)
-            last_error = msg
-            # Window may have been closed and reopened: try to re-resolve.
-            if not args.window.isdigit():
-                w = find_window(args.window)
-                if w is not None and w["id"] != window["id"]:
-                    window = w
-                    print(f"Re-attached to window {window['id']}: {describe(window)}",
-                          flush=True)
-        time.sleep(args.interval)
+            reqs = sorted(f for f in os.listdir(req_dir) if REQUEST_RE.match(f))
+        except OSError:
+            reqs = []
+
+        if not reqs:
+            time.sleep(args.poll)
+            continue
+
+        # One capture answers every pending request; excess requests are
+        # refused rather than queued.
+        for req in reqs[MAX_REQUESTS:]:
+            reply(req_dir, req, ".err", "too many pending requests")
+        reqs = reqs[:MAX_REQUESTS]
+
+        wait = last_capture + args.min_interval - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+
+        current = resolve(args.window, window)
+        if current is None:
+            msg = (f"the approved window ({describe(window)}) is not on screen; "
+                   "ask the user to show it")
+            print(f"capture refused: {msg}", file=sys.stderr, flush=True)
+            for req in reqs:
+                reply(req_dir, req, ".err", msg)
+            continue
+
+        if current["id"] != window["id"]:
+            print(f"Re-attached to window {current['id']}: {describe(current)}",
+                  flush=True)
+        window = current
+
+        try:
+            capture(window["id"], output, args.max_size)
+            result = (".done", os.path.basename(output))
+            print(f"captured for {len(reqs)} request(s)", flush=True)
+        except Exception as e:  # window minimised etc.
+            result = (".err", f"capture failed: {e}")
+            print(f"capture failed: {e}", file=sys.stderr, flush=True)
+        last_capture = time.monotonic()
+
+        for req in reqs:
+            reply(req_dir, req, *result)
     return 0
 
 

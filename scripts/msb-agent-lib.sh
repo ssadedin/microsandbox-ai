@@ -348,15 +348,15 @@ msb_agent_run() {
     # Parse common options; everything else goes to the agent.
     #
     #   --with-screenshots [WINDOW]
-    #       Continuously capture a host (macOS) window into
-    #       /workspace/.<tool>/screenshot.png so the agent can see it.
+    #       Let the agent capture a single host (macOS) window on
+    #       demand with the msb-screenshot guest command.
     #       WINDOW is a window id or name substring; if omitted, the
     #       user is asked to pick from a list of open windows.
     # ------------------------------------------------------------
 
     local screenshots=0
     local screenshot_window="${MSB_AGENT_SCREENSHOT_WINDOW:-${PI_MSB_SCREENSHOT_WINDOW:-}}"
-    local screenshot_interval="${MSB_AGENT_SCREENSHOT_INTERVAL:-${PI_MSB_SCREENSHOT_INTERVAL:-2}}"
+    local screenshot_min_interval="${MSB_AGENT_SCREENSHOT_MIN_INTERVAL:-1}"
     local screenshot_max_size="${MSB_AGENT_SCREENSHOT_MAX_SIZE:-${PI_MSB_SCREENSHOT_MAX_SIZE:-1600}}"
     local -a passthrough_args
 
@@ -938,9 +938,14 @@ msb_agent_run() {
     || return 1
 
     # ------------------------------------------------------------
-    # Make Java trust the TLS interception CA (msb already covers the
-    # system store, curl, Python, Node etc.). Re-run after every apt
-    # install so JDKs installed by the agent are covered too.
+    # Install guest helpers:
+    #
+    #   msb-trust-java  Make Java trust the TLS interception CA (msb
+    #                   already covers the system store, curl, Python,
+    #                   Node etc.). Re-run after every apt install so
+    #                   JDKs installed by the agent are covered too.
+    #   msb-screenshot  Request a screenshot from the host (see
+    #                   --with-screenshots).
     # ------------------------------------------------------------
 
     msb exec -q "$name" -- \
@@ -948,7 +953,8 @@ msb_agent_run() {
             set -euo pipefail
 
             printf "%s" "$1" > /usr/local/bin/msb-trust-java
-            chmod 0755 /usr/local/bin/msb-trust-java
+            printf "%s" "$2" > /usr/local/bin/msb-screenshot
+            chmod 0755 /usr/local/bin/msb-trust-java /usr/local/bin/msb-screenshot
 
             printf "%s\n" \
                 "DPkg::Post-Invoke { \"/usr/local/bin/msb-trust-java -q || true\"; };" \
@@ -956,9 +962,10 @@ msb_agent_run() {
 
             /usr/local/bin/msb-trust-java
         ' \
-        msb-trust-java-setup \
+        msb-agent-helpers-setup \
         "$(< "$_MSB_AGENT_LIB_DIR/msb-trust-java.sh")" \
-    || echo "warning: could not set up Java trust for the TLS interception CA" >&2
+        "$(< "$_MSB_AGENT_LIB_DIR/msb-screenshot.sh")" \
+    || echo "warning: could not install guest helpers (Java CA trust, screenshots)" >&2
 
     # ------------------------------------------------------------
     # Install the agent (agent specific).
@@ -984,45 +991,45 @@ msb_agent_run() {
     fi
 
     # ------------------------------------------------------------
-    # Screenshot proxy: capture on the host into the mounted
-    # workspace, where the guest sees it at /workspace/.<tool>/.
+    # Screenshots: a host helper watches /workspace/.<tool>/ (via the
+    # mounted workspace) for requests from msb-screenshot and answers
+    # each with a fresh capture of the approved window.
     # ------------------------------------------------------------
 
     local screenshot_pid=""
 
     if (( screenshots )); then
         local shot_dir="$dir/.$tool"
-        local shot_file="$shot_dir/screenshot.png"
         local shot_log="$shot_dir/screenshots.log"
-        local guest_shot="/workspace/.$tool/screenshot.png"
 
         mkdir -p "$shot_dir" || return 1
         # Keep the capture directory out of git.
         [[ -f "$shot_dir/.gitignore" ]] || printf '*\n' > "$shot_dir/.gitignore"
-        rm -f "$shot_file"
+        rm -rf "$shot_dir/screenshot.png" "$shot_dir/screenshot-requests"
 
-        echo "Starting screenshot capture for window: $screenshot_window"
+        echo "Starting on-demand screenshot helper for window: $screenshot_window"
 
         uv run --quiet --no-project --with pyobjc-framework-Quartz \
             python3 "$_MSB_AGENT_LIB_DIR/capture_screenshots.py" \
-            --output "$shot_file" \
-            --interval "$screenshot_interval" \
+            --dir "$shot_dir" \
+            --min-interval "$screenshot_min_interval" \
             --max-size "$screenshot_max_size" \
             --parent-pid "$$" \
             "$screenshot_window" \
             > "$shot_log" 2>&1 &
         screenshot_pid=$!
 
-        # Wait briefly for the first frame so failures are visible now.
+        # Wait for its test capture so failures (e.g. missing Screen
+        # Recording permission) are visible now.
         local i
-        for (( i = 0; i < 50; i++ )); do
-            [[ -s "$shot_file" ]] && break
+        for (( i = 0; i < 100; i++ )); do
+            grep -q '^Ready:' "$shot_log" 2>/dev/null && break
             kill -0 "$screenshot_pid" 2>/dev/null || break
             sleep 0.2
         done
 
-        if [[ ! -s "$shot_file" ]]; then
-            echo "error: screenshot capture failed; see $shot_log" >&2
+        if ! grep -q '^Ready:' "$shot_log" 2>/dev/null; then
+            echo "error: screenshot helper failed to start; see $shot_log" >&2
             echo "       (if window titles are missing from the list, the terminal needs" >&2
             echo "        Screen Recording permission: System Settings -> Privacy & Security)" >&2
             sed 's/^/       /' "$shot_log" >&2
@@ -1030,9 +1037,11 @@ msb_agent_run() {
             return 1
         fi
 
-        echo "Screenshot capture started (PID: $screenshot_pid, log: $shot_log)"
+        echo "Screenshot helper started (PID: $screenshot_pid, log: $shot_log)"
 
-        extra_system_prompt+=$'\n\n'"A live screenshot of the user's application window ($screenshot_window) is available at $guest_shot. It is refreshed every $screenshot_interval seconds from the host. Use the read tool on that file whenever you need to see the current state of the UI (e.g. after making a change, wait a few seconds and read it again)."
+        agent_env_args+=( --env "MSB_SCREENSHOT_DIR=/workspace/.$tool" )
+
+        extra_system_prompt+=$'\n\n'"You can see the user's application window ($screenshot_window), and only that window: run \`msb-screenshot\`, which asks the host for a fresh capture and prints the path of the PNG, then view that file with your read tool. Use it to check UI changes; after a change, allow time for the app to reload before capturing. If it reports the window is not on screen, ask the user to show it."
     fi
 
     if [[ "$env_mode" == squashed ]]; then
