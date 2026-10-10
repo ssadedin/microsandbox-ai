@@ -110,6 +110,14 @@ claude_msb_install() {
 }
 
 # ----------------------------------------------------------------
+# Where Claude keeps user-level MCP servers (for --gitlab-issue).
+# ----------------------------------------------------------------
+claude_msb_mcp_config() {
+    mcp_file=".claude.json"
+    mcp_extra="{}"
+}
+
+# ----------------------------------------------------------------
 # Build the Claude command line.
 # ----------------------------------------------------------------
 claude_msb_args() {

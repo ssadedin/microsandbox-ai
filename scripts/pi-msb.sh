@@ -169,6 +169,14 @@ pi_msb_install() {
 # ----------------------------------------------------------------
 # Build the Pi command line.
 # ----------------------------------------------------------------
+# Where Pi keeps user-level MCP servers (for --gitlab-issue). The
+# user-level file avoids Pi's project trust prompt, and "direct" puts
+# the few tools in front of the model instead of behind codemode search.
+pi_msb_mcp_config() {
+    mcp_file=".pi/agent/mcp.json"
+    mcp_extra='{"exposure":"direct","description":"GitLab: read/comment on the assigned ticket, submit and comment on a merge request"}'
+}
+
 pi_msb_args() {
 
     # Default to a Bedrock model when Bedrock is enabled and the caller
