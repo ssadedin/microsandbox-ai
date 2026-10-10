@@ -701,7 +701,7 @@ def main():
     ap.add_argument("-d", "--dir", help="request directory (required unless --check)")
     ap.add_argument("--check", action="store_true",
                     help="validate config and access, print the normalised issue "
-                         "reference on stdout, and exit")
+                         "reference and the branch (two lines) on stdout, and exit")
     ap.add_argument("--poll", type=float, default=0.2)
     ap.add_argument("--max-writes", type=int, default=40,
                     help="comments, pushes and MRs allowed per session (default 40)")
@@ -733,6 +733,7 @@ def main():
 
     if args.check:
         print(target.issue_ref)
+        print(target.branch)
         return 0
     return serve(bridge, args.dir, args.poll, args.parent_pid, args.min_write_interval)
 
