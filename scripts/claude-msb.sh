@@ -248,13 +248,27 @@ _claude_msb_token() {
         fi
     fi
 
+    local line token_re='^sk-ant-[A-Za-z0-9_-]+$'
+
+    # Full-screen apps (like claude setup-token) can leave bracketed
+    # paste on, which wraps pasted text in ESC[200~ ... ESC[201~.
+    printf '\033[?2004l' > /dev/tty 2>/dev/null
+
     read -r -s -p "Paste the token (input hidden): " token || return 1
+
+    # A token copied from a wrapped terminal line can arrive as several
+    # lines; collect the rest of the paste.
+    while IFS= read -r -s -t 1 line; do
+        token+="$line"
+    done
     echo >&2
 
-    token="${token//[[:space:]]/}"
+    # Drop any paste markers and whitespace.
+    token="$(printf '%s' "$token" | tr -d '\033' | sed 's/\[20[01]~//g' | tr -d '[:space:]')"
 
-    if [[ "$token" != sk-ant-* ]]; then
+    if [[ ! "$token" =~ $token_re ]]; then
         echo "error: that doesn't look like a Claude token (expected sk-ant-...)" >&2
+        echo "       received ${#token} characters starting with: $(printf '%s' "${token:0:12}" | cat -v)" >&2
         return 1
     fi
 
