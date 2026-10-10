@@ -33,7 +33,9 @@ then prompt "Work on issue 32". The agent gets five tools (MCP server
 one), read the MR, and comment on it. None takes a ticket, project or
 branch argument, so the agent can only act on the issue you named and the
 branch checked out at startup. The default and protected branches are
-never pushed, and there is no force push.
+never pushed, and there is no force push. Start the agent on a feature
+branch: the launcher refuses the default branch, and the session stays bound
+to the branch checked out at startup (restart it after switching branches).
 
 The instance and token live on the host in
 `~/.config/msb-agent/gitlab.json`, which the sandbox cannot see:

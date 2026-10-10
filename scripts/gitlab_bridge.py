@@ -371,6 +371,18 @@ class Bridge:
             raise BridgeError("write limit for this session reached; ask the user to continue")
         self.writes_left -= 1
 
+    def _check_branch(self):
+        """The session is bound to the branch checked out at startup."""
+        try:
+            now = current_branch(self.t.git_dir)
+        except BridgeError as e:
+            now = f"({e})"
+        if now != self.t.branch:
+            raise BridgeError(
+                f"this session is bound to branch {self.t.branch}, but the checkout is now on "
+                f"{now}. Nothing was sent to GitLab. Switching branches is not supported: "
+                f"tell the user, who needs to restart the agent on the right branch.")
+
     def _open_mr(self):
         mrs = self.gl.call("GET", f"{self.gl.project_path(self.t.project)}/merge_requests",
                            {"source_branch": self.t.branch, "state": "opened"})
@@ -416,6 +428,7 @@ class Bridge:
         return f"Comment posted on issue {self.t.issue_ref} (note {note.get('id')})."
 
     def get_merge_request(self, req):
+        self._check_branch()
         mr = self._open_mr()
         if mr is None:
             return (f"No open merge request for branch {self.t.branch} in {self.t.project}. "
@@ -436,6 +449,7 @@ class Bridge:
 
     def comment_merge_request(self, req):
         body = self._body(req)
+        self._check_branch()
         mr = self._open_mr()
         if mr is None:
             raise BridgeError(f"no open merge request for branch {self.t.branch}; submit one first")
@@ -456,6 +470,7 @@ class Bridge:
         if not isinstance(description, str) or len(description) > MAX_BODY:
             raise BridgeError(f"'description' must be text of at most {MAX_BODY} characters")
 
+        self._check_branch()
         proj = self.gl.project_path(self.t.project)
         info = self.gl.call("GET", proj)
         target = info.get("default_branch")
@@ -704,7 +719,11 @@ def main():
 
         # Verify access now so mistakes surface before the sandbox is set up.
         issue = bridge.gl.call("GET", bridge._issue_path())
-        bridge.gl.call("GET", bridge.gl.project_path(target.project))
+        default = bridge.gl.call("GET", bridge.gl.project_path(target.project)).get("default_branch")
+        if target.branch in (default, "main", "master"):
+            raise BridgeError(
+                f"the checkout is on {target.branch}, which an agent must never push. "
+                f"Check out or create a feature branch for the issue, then start again.")
         print(f"GitLab {target.base}: issue {target.issue_ref} "
               f"({issue.get('title', '')!r}); MRs from {target.branch} in {target.project}",
               file=sys.stderr, flush=True)
