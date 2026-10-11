@@ -90,7 +90,7 @@ _MSB_AGENT_NET_ALLOW_DEFAULT=(
     get.pnpm.io bun.sh "*.jsr.io" deno.land dl.deno.land
 
     # Python
-    pypi.org "*.python.org" "*.pythonhosted.org" bootstrap.pypa.io astral.sh
+    pypi.org "*.python.org" "*.pythonhosted.org" bootstrap.pypa.io "*.astral.sh"    # uv: installer, releases.astral.sh
     "*.anaconda.org" "*.anaconda.com"
 
     # Java / JVM
