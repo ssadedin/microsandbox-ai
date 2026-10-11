@@ -8,14 +8,15 @@ This repository provides some simple wrappers for AI tools including:
 These tools are best run within sandboxes, however doing so can be
 cumbersome. These scripts facilitate some niceties including:
 
-- setup of secrets for OpenRouter, Bedrock and Anthropic
-  automatically with passthrough
-- add pass through of common networking requirements so that
+- setup of secrets for OpenRouter, Bedrock and Anthropic (both short-lived)
+  automatically with placeholders passed through to the AI models and 
+  transparent substitution via TLS interception
+- restricted network with auto-whitelist of common networking requirements so that
   sandboxes can install tools, language SDKs and other
   resources
-- addition of live capture screenshot tool to enable
-  models to request and receive screenshots of a host
-  window
+- addition of live capture screenshot MCP tool to enable
+  models to request and receive screenshots of a specified host
+  window (fully controlled from host-side)
 - GitLab access without credentials in the sandbox: the agent gets MCP
   tools bound to one issue and the current branch, and a host process
   does the work (see below)
