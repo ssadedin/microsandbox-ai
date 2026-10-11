@@ -21,6 +21,79 @@ cumbersome. These scripts facilitate some niceties including:
   tools bound to one issue and the current branch, and a host process
   does the work (see below)
 
+## Architecture
+
+```plantuml
+@startuml
+skinparam shadowing false
+skinparam componentStyle rectangle
+skinparam defaultTextAlignment center
+skinparam packageStyle rectangle
+skinparam ArrowFontSize 11
+left to right direction
+
+actor "User" as user
+
+package "Host (trusted)" as host #F4F8FF {
+  component "claude-msb.sh\npi-msb.sh" as entry
+  component "msb-agent-lib.sh\nsandbox lifecycle, network allowlist,\n.env handling, prompt assembly" as lib
+  component "msb\nmicrosandbox runtime:\nTLS interception, allowlist,\nsecret substitution" as msb
+  component "gitlab_bridge.py\nprepare | serve | finish\n(+ gitlab_repos.py, gitlab_common.py)" as bridge
+  component "capture_screenshots.py\n(macOS)" as shots
+  database "Credentials\nKeychain / token file,\n$HOME/.aws profile (signed via uv),\nhost pi" as creds
+  database "Config and state\n$HOME/.config/msb-agent/\n$HOME/.local/state/msb-agent/" as cfg
+}
+
+package "Sandbox VM (untrusted)" as vm #FFF6F0 {
+  component "Agent\nClaude Code / Pi" as agent
+  component "msb-gitlab-mcp\n(MCP server)" as mcp
+  component "msb-screenshot" as shot
+  folder "/workspace\nthe checkout, or a submodule plus\nits own git dir\n(request files live here)" as ws
+}
+
+cloud "LLM providers\nAnthropic, Bedrock,\nOpenRouter, OpenAI" as llm
+cloud "GitLab\nself-hosted or gitlab.com" as gl
+cloud "Allowlisted internet\nDebian mirrors, package\nregistries, GitHub" as net
+
+user --> entry : run
+entry --> lib : sources
+lib --> msb : create / modify / exec
+lib ..> creds : resolve (never enters VM)
+lib ..> cfg : read
+lib --> bridge : prepare (prompts),\nstart serve, finish
+lib --> shots : start (optional)
+msb --> agent : runs
+
+agent --> mcp : MCP (stdio)
+agent --> shot : command
+mcp --> ws : request files
+shot --> ws : request files
+bridge <-- ws : polls request files
+shots <-- ws : polls request files
+
+agent ..> msb : outbound HTTPS
+msb ..> llm : placeholder replaced\nby the real key
+msb ..> net : allowlisted hosts only
+bridge ..> gl : REST API, git fetch and push\n(token stays on the host)
+@enduml
+```
+
+(GitLab renders the diagram above when its PlantUML integration is enabled;
+the source is plain text otherwise.)
+
+- **Trust boundary.** The sandbox is untrusted: anything the agent can write
+  (the checkout, `.git`, the request files) is treated as hostile by the host
+  helpers, which validate requests, never follow symlinks out of the request
+  directory, and run git with hooks and the checkout's config disabled.
+- **Credentials stay on the host.** Keys and tokens are resolved on the host and
+  given to `msb` as secrets. The VM only holds placeholders, which `msb`'s TLS
+  interception replaces on requests to the one allowed host.
+- **No network path to the host helpers.** The agent talks to `gitlab_bridge.py`
+  and `capture_screenshots.py` only through request files in the mounted
+  workspace; each request names an operation, never a target.
+- **Restricted network.** Outbound traffic is limited to an allowlist (see
+  `msb-agent-lib.sh`, extended per repo in `.msb-agent/allowed-hosts`).
+
 ## Pi credentials
 
 `pi-msb` resolves model credentials on the host, so the sandbox only ever holds
