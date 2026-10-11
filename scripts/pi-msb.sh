@@ -104,33 +104,16 @@ pi_msb_credentials() {
     # verbatim in the Authorization header, so msb can substitute it.
     # ------------------------------------------------------------
 
-    if [[ "${PI_MSB_BEDROCK:-1}" != "0" ]]; then
-        credential="$(_pi_msb_bedrock_token \
-            "$bedrock_profile" "$bedrock_region" "$bedrock_expiry")"
+    if [[ "${PI_MSB_BEDROCK:-1}" != "0" ]] && \
+       msb_agent_bedrock "$bedrock_profile" "$bedrock_region" "$bedrock_expiry"
+    then
+        bedrock_enabled=1
 
-        if [[ -n "$credential" ]]; then
-            AWS_BEARER_TOKEN_BEDROCK="$credential"
-            export AWS_BEARER_TOKEN_BEDROCK
-            bedrock_enabled=1
-
-            msb_agent_add_secret AWS_BEARER_TOKEN_BEDROCK \
-                "bedrock-runtime.${bedrock_region}.amazonaws.com"
-
-            # Non-secret config only. Token is region-bound, so the guest
-            # region must match the signing region.
-            agent_env_args+=(
-                --env "AWS_REGION=$bedrock_region"
-                --env "AWS_DEFAULT_REGION=$bedrock_region"
-            )
-
-            # The AWS SDK uses HTTP/2 for bedrock-runtime by default, which
-            # fails through msb's secret-substituting TLS proxy with
-            # "Protocol error". Force HTTP/1.1 unless explicitly disabled.
-            if [[ "${PI_MSB_BEDROCK_FORCE_HTTP1:-1}" == "1" ]]; then
-                agent_env_args+=( --env "AWS_BEDROCK_FORCE_HTTP1=1" )
-            fi
-
-            echo "Bedrock: short-term token minted from profile '$bedrock_profile' ($bedrock_region, ${bedrock_expiry}s)"
+        # The AWS SDK uses HTTP/2 for bedrock-runtime by default, which
+        # fails through msb's secret-substituting TLS proxy with
+        # "Protocol error". Force HTTP/1.1 unless explicitly disabled.
+        if [[ "${PI_MSB_BEDROCK_FORCE_HTTP1:-1}" == "1" ]]; then
+            agent_env_args+=( --env "AWS_BEDROCK_FORCE_HTTP1=1" )
         fi
     fi
 
@@ -209,77 +192,6 @@ pi_msb_args() {
     fi
 
     agent_args+=( "$@" )
-}
-
-# ----------------------------------------------------------------
-# Print a short-term Amazon Bedrock API key (bearer token) signed with
-# credentials from the given AWS profile. Prints nothing on failure
-# (e.g. profile missing), so Bedrock is simply not enabled.
-#
-# Equivalent to AWS's aws-bedrock-token-generator: a SigV4 presigned
-# CallWithBearerToken URL, base64 encoded, prefixed "bedrock-api-key-".
-# Lifetime is min(expiry, remaining lifetime of the signing creds).
-#
-# Usage: _pi_msb_bedrock_token PROFILE REGION EXPIRY_SECONDS
-# ----------------------------------------------------------------
-_pi_msb_bedrock_token() {
-    local profile="$1" region="$2" expiry="$3"
-
-    command -v uv >/dev/null 2>&1 || {
-        echo "Bedrock: skipped: uv not found on the host (it signs the token); install it from https://docs.astral.sh/uv/" >&2
-        return 0
-    }
-
-    # Run in a clean-ish env: ignore ambient AWS credentials so only the
-    # dedicated profile is ever used.
-    env -u AWS_ACCESS_KEY_ID \
-        -u AWS_SECRET_ACCESS_KEY \
-        -u AWS_SESSION_TOKEN \
-        -u AWS_BEARER_TOKEN_BEDROCK \
-        AWS_PROFILE="$profile" \
-        uv run --quiet --no-project --with botocore python3 - \
-            "$profile" "$region" "$expiry" <<'PY'
-import base64, sys
-from botocore.session import Session
-from botocore.exceptions import ProfileNotFound, BotoCoreError
-from botocore.auth import SigV4QueryAuth
-from botocore.awsrequest import AWSRequest
-
-profile, region, expiry = sys.argv[1], sys.argv[2], int(sys.argv[3])
-
-try:
-    creds = Session(profile=profile).get_credentials()
-except ProfileNotFound:
-    found = ", ".join(sorted(Session().available_profiles)) or "none"
-    print(f"Bedrock: skipped: AWS profile '{profile}' not found (profiles in ~/.aws: {found}).\n"
-          f"         Use a dedicated profile named '{profile}', or choose one with PI_MSB_AWS_PROFILE=<name>.",
-          file=sys.stderr)
-    sys.exit(0)
-except BotoCoreError as e:
-    print(f"Bedrock: skipped ({e})", file=sys.stderr)
-    sys.exit(0)
-
-if creds is None:
-    print(f"Bedrock: skipped (no credentials for profile '{profile}')", file=sys.stderr)
-    sys.exit(0)
-
-try:
-    creds = creds.get_frozen_credentials()
-except BotoCoreError as e:   # e.g. expired SSO session
-    print(f"Bedrock: skipped ({e})", file=sys.stderr)
-    sys.exit(0)
-
-req = AWSRequest(
-    method="POST",
-    url="https://bedrock.amazonaws.com/",
-    headers={"host": "bedrock.amazonaws.com"},
-    params={"Action": "CallWithBearerToken"},
-)
-SigV4QueryAuth(creds, "bedrock", region, expires=expiry).add_auth(req)
-
-url = req.url.replace("https://", "", 1) + "&Version=1"
-print("bedrock-api-key-" + base64.b64encode(url.encode()).decode())
-PY
 }
 
 pi-msb "$@"

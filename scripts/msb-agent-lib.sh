@@ -294,21 +294,153 @@ _msb_agent_seed_env() {
 # The variable must be exported on the host. The guest only ever sees
 # a placeholder, which msb substitutes on requests to HOST.
 #
-# Usage: msb_agent_add_secret VAR HOST [OPTS]
+# Usage: msb_agent_add_secret VAR HOST[,HOST...] [OPTS]
 #   OPTS: msb secret options, e.g. "body". Defaults to
-#         "passthrough=HOST", which works around an msb 0.7.3 bug where
-#         any '%' in a request body drops the connection when a header
-#         secret is substituted (microsandbox#1664). Headers are still
-#         substituted and the body is passed through unchanged, so the
-#         real secret can never be echoed back into the sandbox. Pass ""
-#         for msb's default once a fixed msb is released.
+#         "passthrough=HOST" for each host, which works around an msb
+#         0.7.3 bug where any '%' in a request body drops the connection
+#         when a header secret is substituted (microsandbox#1664).
+#         Headers are still substituted and the body is passed through
+#         unchanged, so the real secret can never be echoed back into
+#         the sandbox. Pass "" for msb's default once a fixed msb is
+#         released.
 # ----------------------------------------------------------------
 msb_agent_add_secret() {
-    local var="$1" host="$2" opts="${3-passthrough=$2}"
+    local var="$1" hosts="$2" opts cli_opts host
+    local -a host_list
 
-    secret_args+=( --secret "${var}${opts:+:$opts}@${host}" )
+    IFS=, read -r -a host_list <<< "$hosts"
+
+    if (( $# >= 3 )); then
+        # Explicit options are used as given.
+        opts="$3"
+        cli_opts="$3"
+    else
+        # secret_specs holds one passthrough=HOST per host (compared with
+        # what msb reports); msb itself wants passthrough=[H1,H2] for
+        # several hosts.
+        opts=""
+        for host in "${host_list[@]}"; do
+            opts+="${opts:+,}passthrough=$host"
+        done
+
+        if (( ${#host_list[@]} == 1 )); then
+            cli_opts="passthrough=${host_list[0]}"
+        else
+            cli_opts="passthrough=[$hosts]"
+        fi
+    fi
+
+    secret_args+=( --secret "${var}${cli_opts:+:$cli_opts}@${hosts}" )
     secret_specs+=( "$var|$opts" )
-    net_allow+=( "$host" )
+    net_allow+=( "${host_list[@]}" )
+}
+
+# ----------------------------------------------------------------
+# Mint a short-term Amazon Bedrock API key on the host and register it
+# as a secret, plus the non-secret settings that go with it. Shared by
+# the agents that can use Bedrock.
+#
+# The caller must declare `local AWS_BEARER_TOKEN_BEDROCK=""` first, so
+# the exported value stays out of the caller's caller (as with other
+# secrets). Returns 1 (with the reason on stderr) if no key was minted.
+#
+# Usage: msb_agent_bedrock PROFILE REGION EXPIRY_SECONDS [control-plane]
+#   control-plane  also accept the key on bedrock.<region>, which some
+#                  agents use for model checks and token counting
+# ----------------------------------------------------------------
+msb_agent_bedrock() {
+    local profile="$1" region="$2" expiry="$3" hosts credential
+
+    credential="$(_msb_agent_bedrock_token "$profile" "$region" "$expiry")"
+    [[ -n "$credential" ]] || return 1
+
+    AWS_BEARER_TOKEN_BEDROCK="$credential"
+    export AWS_BEARER_TOKEN_BEDROCK
+
+    hosts="bedrock-runtime.${region}.amazonaws.com"
+    [[ "${4:-}" == control-plane ]] && hosts+=",bedrock.${region}.amazonaws.com"
+    msb_agent_add_secret AWS_BEARER_TOKEN_BEDROCK "$hosts"
+
+    # Non-secret config only. The key is region-bound, so the guest's
+    # region must match the signing region.
+    agent_env_args+=(
+        --env "AWS_REGION=$region"
+        --env "AWS_DEFAULT_REGION=$region"
+    )
+
+    echo "Bedrock: short-term token minted from profile '$profile' ($region, ${expiry}s)"
+}
+
+# ----------------------------------------------------------------
+# Print a short-term Amazon Bedrock API key (bearer token) signed with
+# credentials from the given AWS profile. Prints nothing on failure
+# (e.g. profile missing), so Bedrock is simply not enabled.
+#
+# Equivalent to AWS's aws-bedrock-token-generator: a SigV4 presigned
+# CallWithBearerToken URL, base64 encoded, prefixed "bedrock-api-key-".
+# Lifetime is min(expiry, remaining lifetime of the signing creds).
+#
+# Usage: _msb_agent_bedrock_token PROFILE REGION EXPIRY_SECONDS
+# ----------------------------------------------------------------
+_msb_agent_bedrock_token() {
+    local profile="$1" region="$2" expiry="$3"
+
+    command -v uv >/dev/null 2>&1 || {
+        echo "Bedrock: skipped: uv not found on the host (it signs the token); install it from https://docs.astral.sh/uv/" >&2
+        return 0
+    }
+
+    # Run in a clean-ish env: ignore ambient AWS credentials so only the
+    # dedicated profile is ever used.
+    env -u AWS_ACCESS_KEY_ID \
+        -u AWS_SECRET_ACCESS_KEY \
+        -u AWS_SESSION_TOKEN \
+        -u AWS_BEARER_TOKEN_BEDROCK \
+        AWS_PROFILE="$profile" \
+        uv run --quiet --no-project --with botocore python3 - \
+            "$profile" "$region" "$expiry" <<'PY'
+import base64, sys
+from botocore.session import Session
+from botocore.exceptions import ProfileNotFound, BotoCoreError
+from botocore.auth import SigV4QueryAuth
+from botocore.awsrequest import AWSRequest
+
+profile, region, expiry = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+try:
+    creds = Session(profile=profile).get_credentials()
+except ProfileNotFound:
+    found = ", ".join(sorted(Session().available_profiles)) or "none"
+    print(f"Bedrock: skipped: AWS profile '{profile}' not found (profiles in ~/.aws: {found}).\n"
+          f"         Use a dedicated profile named '{profile}', or choose another with PI_MSB_AWS_PROFILE=<name>\n"
+          f"         (pi-msb) or CLAUDE_MSB_AWS_PROFILE=<name> (claude-msb).",
+          file=sys.stderr)
+    sys.exit(0)
+except BotoCoreError as e:
+    print(f"Bedrock: skipped ({e})", file=sys.stderr)
+    sys.exit(0)
+
+if creds is None:
+    print(f"Bedrock: skipped (no credentials for profile '{profile}')", file=sys.stderr)
+    sys.exit(0)
+
+try:
+    creds = creds.get_frozen_credentials()
+except BotoCoreError as e:   # e.g. expired SSO session
+    print(f"Bedrock: skipped ({e})", file=sys.stderr)
+    sys.exit(0)
+
+req = AWSRequest(
+    method="POST",
+    url="https://bedrock.amazonaws.com/",
+    headers={"host": "bedrock.amazonaws.com"},
+    params={"Action": "CallWithBearerToken"},
+)
+SigV4QueryAuth(creds, "bedrock", region, expires=expiry).add_auth(req)
+
+url = req.url.replace("https://", "", 1) + "&Version=1"
+print("bedrock-api-key-" + base64.b64encode(url.encode()).decode())
+PY
 }
 
 # ----------------------------------------------------------------
