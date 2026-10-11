@@ -27,7 +27,8 @@ placeholders:
 
 - **OpenRouter, OpenAI, Anthropic:** read from a host `pi` install if there is
   one (`pi auth print-api-key`). Without host pi these are skipped.
-- **Amazon Bedrock:** a short-lived Bedrock API key is minted from a dedicated
+- **Amazon Bedrock:** a short-lived Bedrock API key is minted (the same
+  mechanism `claude-msb` can use, see below) from a dedicated
   AWS profile named `pi-msb` in `~/.aws/credentials` or `~/.aws/config` (or the
   profile named by `PI_MSB_AWS_PROFILE`; `PI_MSB_AWS_REGION` defaults to
   `ap-southeast-2`). It needs `uv` on the host to sign the token. A dedicated,
@@ -55,8 +56,39 @@ placeholder that `msb` substitutes on requests to that host.
 - **Overrides:** `CLAUDE_MSB_OAUTH_TOKEN` uses a token for one run without
   storing it. `CLAUDE_MSB_SECRET_OPTS` changes the `msb` secret options (see
   `msb_agent_add_secret`).
-- **Not supported:** Amazon Bedrock, API keys and Console accounts. Only the
-  subscription token is used (`pi-msb` is the wrapper with Bedrock support).
+- **Not supported:** API keys and Console accounts. Claude uses either the
+  subscription token or Bedrock (below).
+
+### Claude on Amazon Bedrock
+
+Set `CLAUDE_MSB_BEDROCK=1` to use Bedrock instead of a subscription. It works
+like `pi-msb`: a short-lived Bedrock API key is minted on the host from a
+dedicated AWS profile (`uv` on the host signs it) and handed to `msb` as a
+secret, so the sandbox only holds a placeholder. No subscription token is
+asked for.
+
+```
+CLAUDE_MSB_BEDROCK=1 claude-msb
+```
+
+- **Profile and region:** `CLAUDE_MSB_AWS_PROFILE` (default: `PI_MSB_AWS_PROFILE`,
+  else `pi-msb`, so an existing `pi-msb` profile works as is) and
+  `CLAUDE_MSB_AWS_REGION` (default `ap-southeast-2`). The key expires after
+  `CLAUDE_MSB_BEDROCK_TOKEN_EXPIRY` seconds (default 43200, the maximum).
+- **Models:** Claude's built-in model IDs are for other regions, so the
+  launcher sets `ANTHROPIC_MODEL` to `CLAUDE_MSB_BEDROCK_MODEL` (default
+  `au.anthropic.claude-opus-5-5`; set it to an empty string to leave Claude's
+  default). Background tasks use the main model unless
+  `CLAUDE_MSB_BEDROCK_SMALL_MODEL` is set. `ANTHROPIC_DEFAULT_OPUS_MODEL`,
+  `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL` and
+  `ANTHROPIC_BEDROCK_REGION_PREFIX` are passed through from your environment,
+  which you need for `/model` choices other than the main model.
+- **Separate sandbox:** Bedrock mode uses its own sandbox (`claude-bedrock-<project>`)
+  so subscription and Bedrock secrets never mix; installed packages are not
+  shared between the two.
+- **Network:** the key is substituted only on requests to
+  `bedrock-runtime.<region>.amazonaws.com` and `bedrock.<region>.amazonaws.com`
+  (Claude uses the latter for model checks), and both hosts are allowed.
 
 Other behavior worth knowing: permission prompts are skipped
 (`--dangerously-skip-permissions`; set `CLAUDE_MSB_SKIP_PERMISSIONS=0` to keep

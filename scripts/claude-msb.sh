@@ -6,11 +6,25 @@
 # (macOS Keychain, or a 0600 file elsewhere) and given to msb as a
 # secret, so the sandbox only ever sees a placeholder.
 #
+# With CLAUDE_MSB_BEDROCK=1 Claude uses Amazon Bedrock instead: a
+# short-term Bedrock API key is minted on the host from a dedicated AWS
+# profile (the same mechanism as pi-msb) and passed the same way.
+#
 # Environment:
 #   CLAUDE_MSB_OAUTH_TOKEN      use this token instead of the stored one
 #   CLAUDE_MSB_SECRET_OPTS      msb secret options (default: passthrough
 #                               for api.anthropic.com, see
 #                               msb_agent_add_secret)
+#   CLAUDE_MSB_BEDROCK=1        use Amazon Bedrock instead of a subscription
+#   CLAUDE_MSB_AWS_PROFILE      AWS profile that signs the key (default
+#                               PI_MSB_AWS_PROFILE, else pi-msb)
+#   CLAUDE_MSB_AWS_REGION       default ap-southeast-2
+#   CLAUDE_MSB_BEDROCK_TOKEN_EXPIRY   seconds, default 43200 (max 12h)
+#   CLAUDE_MSB_BEDROCK_MODEL    Bedrock model / inference profile ID
+#                               (default au.anthropic.claude-opus-5-5;
+#                               "" leaves Claude's default)
+#   CLAUDE_MSB_BEDROCK_SMALL_MODEL   model for background tasks (default:
+#                               the main model)
 #   CLAUDE_MSB_SKIP_PERMISSIONS=0   don't pass --dangerously-skip-permissions
 #   CLAUDE_MSB_SYNC             space separated ~/.claude entries to copy
 #                               into the sandbox on each launch
@@ -25,11 +39,14 @@ claude-msb() {
     # Exported by claude_msb_credentials; must outlive it so that msb can
     # read it when creating/modifying the sandbox.
     local CLAUDE_CODE_OAUTH_TOKEN=""
+    local AWS_BEARER_TOKEN_BEDROCK=""
 
     # Separate from pi-msb's sandbox (named after the project alone):
     # msb re-resolves every secret on modify, so a shared sandbox needs
-    # every agent's host credentials.
+    # every agent's host credentials. Bedrock mode has its own too, so
+    # a sandbox never mixes subscription and Bedrock secrets.
     local sandbox_prefix="claude-"
+    [[ "${CLAUDE_MSB_BEDROCK:-0}" == 1 ]] && sandbox_prefix="claude-bedrock-"
 
     msb_agent_run claude "$@"
 }
@@ -38,6 +55,63 @@ claude-msb() {
 # Resolve the subscription token on the host.
 # ----------------------------------------------------------------
 claude_msb_credentials() {
+
+    if [[ "${CLAUDE_MSB_BEDROCK:-0}" == 1 ]]; then
+        _claude_msb_bedrock || return 1
+    else
+        _claude_msb_credentials_subscription || return 1
+    fi
+
+    # Installer and auto-updater downloads.
+    msb_agent_allow_host claude.ai downloads.claude.ai storage.googleapis.com
+
+    # Telemetry and error reporting hosts are not on the allowlist.
+    agent_env_args+=(
+        --env DISABLE_TELEMETRY=1
+        --env DISABLE_ERROR_REPORTING=1
+    )
+}
+
+# ----------------------------------------------------------------
+# Amazon Bedrock: mint a short-term key and tell Claude to use it. The
+# model must be an ID or inference profile available in the region,
+# since Claude's own defaults are for other regions.
+# ----------------------------------------------------------------
+_claude_msb_bedrock() {
+
+    local profile="${CLAUDE_MSB_AWS_PROFILE:-${PI_MSB_AWS_PROFILE:-pi-msb}}"
+    local region="${CLAUDE_MSB_AWS_REGION:-ap-southeast-2}"
+    local expiry="${CLAUDE_MSB_BEDROCK_TOKEN_EXPIRY:-43200}"
+    local model="${CLAUDE_MSB_BEDROCK_MODEL-au.anthropic.claude-opus-5-5}"
+    local small="${CLAUDE_MSB_BEDROCK_SMALL_MODEL:-}"
+    local var
+
+    # Claude also uses the control-plane host for model checks.
+    if ! msb_agent_bedrock "$profile" "$region" "$expiry" control-plane; then
+        {
+            echo "error: could not mint a Bedrock key for Claude."
+            echo "       It needs uv on the host and an AWS profile named '$profile'"
+            echo "       (or CLAUDE_MSB_AWS_PROFILE=<profile>); see the message above."
+        } >&2
+        return 1
+    fi
+
+    agent_env_args+=( --env CLAUDE_CODE_USE_BEDROCK=1 )
+
+    [[ -n "$model" ]] && agent_env_args+=( --env "ANTHROPIC_MODEL=$model" )
+    [[ -n "$small" ]] && agent_env_args+=( --env "ANTHROPIC_SMALL_FAST_MODEL=$small" )
+    [[ -n "$model" ]] && echo "Default model: $model"
+
+    # Non-secret model settings from the host environment.
+    for var in ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
+               ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_BEDROCK_REGION_PREFIX; do
+        [[ -n "${!var:-}" ]] && agent_env_args+=( --env "$var=${!var}" )
+    done
+
+    return 0
+}
+
+_claude_msb_credentials_subscription() {
 
     # Not run in $(...): setup may launch `claude setup-token`, which needs
     # the real terminal on stdin/stdout.
@@ -50,15 +124,6 @@ claude_msb_credentials() {
     else
         msb_agent_add_secret CLAUDE_CODE_OAUTH_TOKEN api.anthropic.com
     fi
-
-    # Installer and auto-updater downloads.
-    msb_agent_allow_host claude.ai downloads.claude.ai storage.googleapis.com
-
-    # Telemetry and error reporting hosts are not on the allowlist.
-    agent_env_args+=(
-        --env DISABLE_TELEMETRY=1
-        --env DISABLE_ERROR_REPORTING=1
-    )
 }
 
 # ----------------------------------------------------------------
