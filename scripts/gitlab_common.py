@@ -13,6 +13,7 @@ objects (objects/info/alternates) and so never reads its config.
 import atexit
 import base64
 import contextlib
+import fnmatch
 import json
 import os
 import re
@@ -75,13 +76,40 @@ def load_config(path):
     return cfg
 
 
+def _is_path_key(key):
+    return key.startswith(("/", "~", ".")) or "$" in key
+
+
 def repo_config(cfg, *checkouts):
-    """The "repos" entry matching any of the given checkout paths."""
+    """The "repos" entry keyed by one of the given checkout paths.
+
+    A key is a path if it starts with /, ~ or . or contains $VARS; "~" and
+    environment variables are expanded. Other keys are project paths, see
+    project_config.
+    """
     wanted = {os.path.realpath(c) for c in checkouts if c}
     for key, val in (cfg.get("repos") or {}).items():
-        if os.path.realpath(os.path.expanduser(key)) in wanted:
+        if _is_path_key(key) and os.path.realpath(
+                os.path.expandvars(os.path.expanduser(key))) in wanted:
             return val or {}
     return {}
+
+
+def project_config(cfg, project):
+    """The "repos" entry keyed by a project path or glob matching this project.
+
+    Project keys name the project the checkout's origin remote points at (for
+    example "group/app" or "group/*"), so one config works on every machine.
+    An exact key beats a glob; otherwise the first match in the file wins.
+    """
+    if not project:
+        return {}
+    matches = [(key, val) for key, val in (cfg.get("repos") or {}).items()
+               if not _is_path_key(key) and fnmatch.fnmatchcase(project, key)]
+    for key, val in matches:
+        if key == project:
+            return val or {}
+    return (matches[0][1] or {}) if matches else {}
 
 
 def parse_remote(url):

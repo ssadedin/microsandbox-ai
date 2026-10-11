@@ -298,12 +298,22 @@ Instance, token and project mapping live on the host in
   project involved, so use a group access token (Developer role) or a personal
   token. `url` defaults to `https://<instance name>`; `ca_file` is a
   complete CA bundle for internal or intercepted hosts (see above). Everything is assumed to live on one instance.
-- `repos` is optional and matches the checkout or, for a linked worktree, its
-  primary checkout. Without an entry the project comes from the `origin` remote
-  (whose host must be a configured instance) and issues are looked up in the
-  same project. Submodule projects are worked out from their URLs (relative
-  ones such as `../x.git` resolve against the parent's remote); `submodules`
-  overrides that per path.
+- `repos` is optional. An entry is keyed either by **project path** (or a glob)
+  or by **checkout path**:
+  - A project key such as `group/app` or `group/*` matches the project the
+    checkout's `origin` remote points at, so the same config works on every
+    machine and is the right choice for a file you share. An exact key beats a
+    glob.
+  - A key that starts with `/`, `~` or `.`, or contains `$VAR`, is a checkout
+    path (`~` and variables are expanded). It matches that checkout or, for a
+    linked worktree, its primary checkout, and wins over a project key.
+
+  Without an entry the project comes from the `origin` remote (whose host must
+  be a configured instance, which is also how the instance is chosen) and
+  issues are looked up in the same project. `instance` and `project` inside an
+  entry are only needed to override that. Submodule projects are worked out
+  from their URLs (relative ones such as `../x.git` resolve against the
+  parent's remote); `submodules` overrides that per path.
 - `working_set` lists the projects (globs allowed) that are checked out to
   their default branch automatically when a submodule is detached, as after a
   fresh clone or in a new worktree. Without it, detached submodules are
@@ -312,3 +322,24 @@ Instance, token and project mapping live on the host in
 
 Only submodules that are initialised at launch take part. Pushes are never
 forced and never target a default or protected branch.
+
+Example working configuration for VCGS repositories / projects. It uses no
+machine-specific paths, so it can be shared as is (each person sets
+`GITLAB_TOKEN`). Both `giphub` and `webservices` (launched on its own, as a
+submodule) match the one `VCGS/CBU/*` entry:
+
+```json
+{
+  "instances": {
+    "git.vcgs.org.au": {
+      "url": "https://git.vcgs.org.au",
+      "token_env": "GITLAB_TOKEN"
+    }
+  },
+  "repos": {
+    "VCGS/CBU/*": {
+      "issue_project": "VCGS/CBU/clinicalbioinformatics"
+    }
+  }
+}
+```

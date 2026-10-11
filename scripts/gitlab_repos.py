@@ -39,7 +39,8 @@ import sys
 from gitlab_common import (
     BridgeError, GitLab, Instance, STATE_DIR, ahead_of_origin, analyse_branch,
     audit_config, find_instance, git, git_net_args, load_config, parse_issue,
-    parse_remote, read_head, read_ref, repo_config, resolve_relative_url,
+    parse_remote, project_config, read_head, read_ref, repo_config,
+    resolve_relative_url,
     slugify, valid_branch, valid_repo_path, PROJECT_RE,
 )
 
@@ -476,7 +477,22 @@ def prepare(args):
     inst = Instance(cfg, inst_key)
     gl = GitLab(inst)
 
-    project = root_cfg.get("project") or inst.project_from_remote(remote)
+    # The project the origin remote points at. An explicit "project" in the
+    # config doesn't need it, so a remote that can't be parsed only matters
+    # if nothing else names the project.
+    remote_project, remote_error = None, None
+    if remote:
+        try:
+            remote_project = inst.project_from_remote(remote)
+        except BridgeError as e:
+            remote_error = e
+    if not root_cfg:
+        root_cfg = project_config(cfg, remote_project)
+    project = root_cfg.get("project") or remote_project
+    if not project:
+        raise remote_error or BridgeError(
+            "cannot work out the project: no origin remote and no \"project\" "
+            "in the GitLab config")
     issue_project, iid = parse_issue(args.issue)
     issue_project = issue_project or root_cfg.get("issue_project") or project
     for p in (project, issue_project):
