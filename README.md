@@ -1,12 +1,21 @@
 # Microsandbox Wrappers for AI Tools
 
-This repository provides some simple wrappers for AI tools including:
+This repository provides some wrappers that launch AI tools inside sandboxes to increase their safety,
+including:
 
 - Claude Code
-- Pi
+- [Pi](https://pi.dev)
 
 These tools are best run within sandboxes, however doing so can be
-cumbersome. These scripts facilitate some niceties including:
+inconvenient and introduces many limitations and challenges. For example:
+
+- the AI tools need secrets but if you put the secret in the sandbox it defeats the 
+  purpose of the sandbox
+- the sandbox needs to be able to see the content it is working on, and any related files,
+  such as git repositories etc, while obscuring sensitive data.
+- host-based functionality such as screenshots don't work inside the sandbox
+
+These scripts facilitate some niceties including:
 
 - setup of secrets for OpenRouter, Bedrock and Anthropic (both short-lived)
   automatically with placeholders passed through to the AI models and 
@@ -20,6 +29,13 @@ cumbersome. These scripts facilitate some niceties including:
 - GitLab access without credentials in the sandbox: the agent gets MCP
   tools bound to one issue and the current branch, and a host process
   does the work (see below)
+
+These scripts utilise [Microsandbox](https://github.com/superradcompany/microsandbox) - a cross platform sandboxing tool 
+that makes it convenient to manage sandboxes based on micro-VMs.  Because they use a full VM,
+the contained agent has full admin / sudo access and can install and run tools such as docker and 
+other platform / infrastructure requirements. The sandboxes are also persistent - so once an agent does 
+do significant setup work, the sandbox can be saved and snapshotted so that it can start again without
+redoing all that work.
 
 ## Architecture
 
