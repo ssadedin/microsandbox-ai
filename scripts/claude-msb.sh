@@ -81,8 +81,9 @@ claude_msb_install() {
 
     _claude_msb_sync_config || return 1
 
-    # Skip first-run onboarding, and trust /workspace so the trust and
-    # bypass-permissions dialogs are not shown on every new sandbox.
+    # Skip first-run onboarding, and trust /workspace (and the directory
+    # the agent starts in, which is deeper for a submodule) so the trust
+    # and bypass-permissions dialogs are not shown on every new sandbox.
     msb exec -q --user "$guest_user" --env "HOME=$guest_home" "$name" -- \
         node -e '
             const fs = require("fs");
@@ -92,9 +93,11 @@ claude_msb_install() {
             cfg.hasCompletedOnboarding = true;
             cfg.bypassPermissionsModeAccepted = true;
             cfg.projects = cfg.projects || {};
-            cfg.projects["/workspace"] = Object.assign(
-                cfg.projects["/workspace"] || {},
-                { hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true });
+            for (const dir of new Set(["/workspace", process.argv[1]])) {
+                cfg.projects[dir] = Object.assign(
+                    cfg.projects[dir] || {},
+                    { hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true });
+            }
             fs.writeFileSync(path, JSON.stringify(cfg, null, 2));
 
             // Current Claude Code reads the bypass-permissions acceptance
@@ -106,7 +109,7 @@ claude_msb_install() {
             settings.skipDangerousModePermissionPrompt = true;
             fs.mkdirSync(process.env.HOME + "/.claude", { recursive: true });
             fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-        '
+        ' "$guest_dir"
 }
 
 # ----------------------------------------------------------------
@@ -203,7 +206,7 @@ _claude_msb_sync_config() {
     if (( copied )); then
         msb exec -q --user "$guest_user" --env "HOME=$guest_home" "$name" -- \
             bash -c 'mkdir -p "$HOME/.claude" && cp -R "$1"/. "$HOME/.claude/"' \
-            claude-msb-sync "/workspace/$stage_rel" \
+            claude-msb-sync "$guest_dir/$stage_rel" \
         || { rm -rf "$stage"; return 1; }
     fi
 

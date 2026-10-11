@@ -20,6 +20,24 @@ cumbersome. These scripts facilitate some niceties including:
   tools bound to one issue and the current branch, and a host process
   does the work (see below)
 
+## Launching inside a submodule
+
+Running a wrapper from inside a submodule scopes the agent to that source
+tree. A submodule's `.git` is a pointer into the superproject, so the sandbox
+mounts just two things, keeping their positions below their nearest common
+parent directory so every relative pointer (including nested submodules')
+still resolves:
+
+```
+<superproject>/libs/a                -> /workspace/libs/a                  (working directory)
+<superproject>/.git/modules/libs/a   -> /workspace/.git/modules/libs/a
+```
+
+The rest of the superproject is not visible. This also covers a superproject
+that is a linked worktree. The layout is fixed when the sandbox is created
+(recorded in the `msb-agent-layout` label), so a sandbox made for another
+layout is refused with a hint to `msb rm` it.
+
 ## GitLab integration
 
 ```

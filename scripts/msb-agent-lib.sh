@@ -329,7 +329,25 @@ _msb_agent_prepare_env() {
         echo "Created empty .env.agent"
     fi
 
-    env_mount_spec="$dir/.env.agent:/workspace/.env:ro,uid=$host_uid,gid=$host_gid,host-perms=private"
+    env_mount_spec="$dir/.env.agent:$guest_dir/.env:ro,uid=$host_uid,gid=$host_gid,host-perms=private"
+}
+
+# ----------------------------------------------------------------
+# Print the deepest directory that contains both absolute paths.
+# ----------------------------------------------------------------
+_msb_agent_common_dir() {
+    local common="" i
+    local -a pa pb
+
+    IFS=/ read -ra pa <<< "$1"
+    IFS=/ read -ra pb <<< "$2"
+
+    for (( i = 1; i < ${#pa[@]} && i < ${#pb[@]}; i++ )); do
+        [[ "${pa[i]}" == "${pb[i]}" ]] || break
+        common+="/${pa[i]}"
+    done
+
+    printf '%s' "${common:-/}"
 }
 
 msb_agent_run() {
@@ -340,6 +358,10 @@ msb_agent_run() {
     local tool="${agent}-msb"
 
     local dir name
+    # Where the checkout appears in the sandbox, and (when it is a
+    # submodule, whose git data lives in the superproject) where its git
+    # directory is mounted; see "Submodule layout" below.
+    local guest_dir="/workspace" guest_gitdir=""
     local git_dir="" git_common="" primary="" source_name=""
     local linked_worktree=0
     local host_uid host_gid
@@ -598,6 +620,43 @@ msb_agent_run() {
                 source_name="${sandbox_prefix:-}$(basename "$primary")"
             fi
         fi
+
+        # ------------------------------------------------------------
+        # Submodule layout. A submodule's .git is a pointer file with a
+        # path relative to the superproject, where the git data lives
+        # (.git/modules/..., or under .git/worktrees/... for a linked
+        # worktree), so mounting only the submodule at /workspace leaves
+        # the pointer, and those of any nested submodules, dangling.
+        # Those pointers never climb above the nearest directory
+        # containing both the submodule and its git data, so mount just
+        # the two, keeping their positions below that directory:
+        #
+        #   <ancestor>/libs/a                  -> /workspace/libs/a
+        #   <ancestor>/.git/modules/libs/a     -> /workspace/.git/modules/libs/a
+        #
+        # and run the agent in /workspace/libs/a. Nothing else from the
+        # superproject is visible.
+        # ------------------------------------------------------------
+
+        if (( ! linked_worktree )) && \
+           [[ -n "$(git -C "$dir" rev-parse --show-superproject-working-tree 2>/dev/null)" ]]
+        then
+            local real_git_dir ancestor rel_dir rel_git
+            real_git_dir="$(cd "$git_dir" && pwd -P)" || return 1
+
+            if [[ "$real_git_dir" != "$dir"/* ]]; then
+                ancestor="$(_msb_agent_common_dir "$dir" "$real_git_dir")"
+                rel_dir="${dir#"$ancestor"}"
+                rel_git="${real_git_dir#"$ancestor"}"
+
+                guest_dir="/workspace${rel_dir%/}"
+                guest_gitdir="/workspace${rel_git%/}"
+                git_dir="$real_git_dir"
+
+                echo "Submodule: mounting only $dir and its git data ($real_git_dir)"
+                echo "           under /workspace; working in $guest_dir"
+            fi
+        fi
     fi
 
     # ------------------------------------------------------------
@@ -686,8 +745,22 @@ msb_agent_run() {
 
         echo "Using existing sandbox: $name"
 
-        local have_label
+        local have_label have_layout
         have_label="$(_msb_agent_label "$name" msb-agent-net open)"
+
+        # Mounts can't change later, so a sandbox created for a different
+        # layout (a submodule launched normally, or the reverse) is wrong
+        # for this launch. Older sandboxes have no label: /workspace.
+        have_layout="$(_msb_agent_label "$name" msb-agent-layout /workspace)"
+        if [[ -n "$have_layout" && "$have_layout" != "$guest_dir" ]]; then
+            {
+                echo "error: sandbox $name was created with the checkout at $have_layout,"
+                echo "       but this launch needs it at $guest_dir. msb can't change mounts"
+                echo "       in place; remove the sandbox (installed packages are lost):"
+                echo "           msb rm $name"
+            } >&2
+            return 1
+        fi
 
         # Sandboxes from before the label always squashed .env.
         env_mode="$(_msb_agent_label "$name" msb-agent-env squashed)"
@@ -742,7 +815,7 @@ msb_agent_run() {
         local -a restore_mounts=()
         if [[ -d "$dir/.msb-agent" ]]; then
             restore_mounts=(
-                -v "$dir/.msb-agent:/workspace/.msb-agent:ro,uid=$host_uid,gid=$host_gid,host-perms=private"
+                -v "$dir/.msb-agent:$guest_dir/.msb-agent:ro,uid=$host_uid,gid=$host_gid,host-perms=private"
             )
         fi
 
@@ -751,7 +824,7 @@ msb_agent_run() {
             --name "$name" \
             --cpus 4 \
             --memory 8G \
-            -v "$dir:/workspace:uid=$host_uid,gid=$host_gid,host-perms=private" \
+            -v "$dir:$guest_dir:uid=$host_uid,gid=$host_gid,host-perms=private" \
             -v "$git_common:$git_common:uid=$host_uid,gid=$host_gid,host-perms=private" \
             ${env_mount_spec:+-v "$env_mount_spec"} \
             "${restore_mounts[@]}" \
@@ -766,6 +839,7 @@ msb_agent_run() {
         msb modify "$name" \
             --label "msb-agent-net=$net_label" \
             --label "msb-agent-env=$env_mode" \
+            --label "msb-agent-layout=$guest_dir" \
             >/dev/null \
         || echo "warning: could not label sandbox $name" >&2
 
@@ -775,8 +849,15 @@ msb_agent_run() {
 
         create_mounts=(
             --mount-dir
-            "$dir:/workspace:uid=$host_uid,gid=$host_gid,host-perms=private"
+            "$dir:$guest_dir:uid=$host_uid,gid=$host_gid,host-perms=private"
         )
+
+        if [[ -n "$guest_gitdir" ]]; then
+            create_mounts+=(
+                --mount-dir
+                "$git_dir:$guest_gitdir:uid=$host_uid,gid=$host_gid,host-perms=private"
+            )
+        fi
 
         if (( linked_worktree )); then
             echo "Git common dir: $git_common"
@@ -796,7 +877,7 @@ msb_agent_run() {
         if [[ -d "$dir/.msb-agent" ]]; then
             create_mounts+=(
                 --mount-dir
-                "$dir/.msb-agent:/workspace/.msb-agent:ro,uid=$host_uid,gid=$host_gid,host-perms=private"
+                "$dir/.msb-agent:$guest_dir/.msb-agent:ro,uid=$host_uid,gid=$host_gid,host-perms=private"
             )
         fi
 
@@ -805,10 +886,11 @@ msb_agent_run() {
             --cpus 4 \
             --memory 8G \
             --root-disk 20G \
-            --workdir /workspace \
+            --workdir "$guest_dir" \
             "${net_create_args[@]}" \
             --label "msb-agent-net=$net_label" \
             --label "msb-agent-env=$env_mode" \
+            --label "msb-agent-layout=$guest_dir" \
             --trust-host-cas \
             "${secret_args[@]}" \
             "${create_mounts[@]}" \
@@ -820,7 +902,7 @@ msb_agent_run() {
         if [[ "$env_mode" == squashed ]]; then
             {
                 echo "warning: $dir/.env exists. The agent sees .env.agent (read-only)"
-                echo "         at /workspace/.env instead, but the real file is still in the"
+                echo "         at $guest_dir/.env instead, but the real file is still in the"
                 echo "         mounted checkout, where root in the sandbox (the agent has sudo)"
                 echo "         can reach it. To keep it out of reach, run agents in a linked"
                 echo "         worktree (git worktree add), which gets its own writable .env"
@@ -1124,9 +1206,9 @@ msb_agent_run() {
         -q \
         --user "$guest_user" \
         "$name" \
-        -- test -w /workspace
+        -- test -w "$guest_dir"
     then
-        echo "error: /workspace is not writable as $guest_user" >&2
+        echo "error: $guest_dir is not writable as $guest_user" >&2
         echo "       the sandbox mounts may have been created by an older $tool version" >&2
         return 1
     fi
@@ -1180,7 +1262,7 @@ msb_agent_run() {
 
         echo "Screenshot helper started (PID: $screenshot_pid, log: $shot_log)"
 
-        agent_env_args+=( --env "MSB_SCREENSHOT_DIR=/workspace/.$tool" )
+        agent_env_args+=( --env "MSB_SCREENSHOT_DIR=$guest_dir/.$tool" )
 
         extra_system_prompt+=$'\n\n'"You can see the user's application window ($screenshot_window), and only that window: run \`msb-screenshot\`, which asks the host for a fresh capture and prints the path of the PNG, then view that file with your read tool. Use it to check UI changes; after a change, allow time for the app to reload before capturing. If it reports the window is not on screen, ask the user to show it."
     fi
@@ -1237,10 +1319,14 @@ msb_agent_run() {
         return 1
     }
 
+    if [[ -n "$guest_gitdir" ]]; then
+        extra_system_prompt+=$'\n\n'"The project you were started in is a git submodule, and you are working in $guest_dir. Only this submodule's working tree and its own git data are present under /workspace; the rest of the superproject is deliberately not available, so keep your changes within this directory."
+    fi
+
     if [[ "$env_mode" == squashed ]]; then
-        extra_system_prompt+=$'\n\n'"/workspace/.env is a read-only stand-in for the project's real .env (the host's .env.agent). If it needs changes, tell the user what to change rather than working around it."
+        extra_system_prompt+=$'\n\n'"$guest_dir/.env is a read-only stand-in for the project's real .env (the host's .env.agent). If it needs changes, tell the user what to change rather than working around it."
     else
-        extra_system_prompt+=$'\n\n'"/workspace/.env (if present) is this sandbox's own copy, seeded from .env.agent; you may edit it. Edit it in place rather than replacing it with a new file."
+        extra_system_prompt+=$'\n\n'"$guest_dir/.env (if present) is this sandbox's own copy, seeded from .env.agent; you may edit it. Edit it in place rather than replacing it with a new file."
     fi
 
     if [[ "$net_mode" == allowlist ]] && (( net_policy_current )); then
@@ -1271,7 +1357,7 @@ msb_agent_run() {
         --env "GIT_COMMITTER_NAME=$git_user_name" \
         --env "GIT_COMMITTER_EMAIL=$git_user_email" \
         "${agent_env_args[@]}" \
-        --workdir /workspace \
+        --workdir "$guest_dir" \
         "$name" \
         -- bash -lc 'cmd="$1"; shift; exec "$cmd" "$@"' "$tool" "$agent_cmd" "${agent_args[@]}" \
     || rc=$?
@@ -1342,7 +1428,7 @@ _msb_agent_mcp_register() {
             fs.mkdirSync(path.dirname(full), { recursive: true });
             fs.writeFileSync(full, JSON.stringify(cfg, null, 2));
         ' \
-        "$mcp_file" "$issue" "$mcp_extra" "/workspace/.$tool/gitlab-requests" \
+        "$mcp_file" "$issue" "$mcp_extra" "$guest_dir/.$tool/gitlab-requests" \
     || {
         echo "error: could not register the GitLab MCP server in the sandbox" >&2
         return 1
