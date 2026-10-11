@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 // ----------------------------------------------------------------
 // MCP server (stdio) giving a sandboxed agent a few GitLab actions on
-// ONE ticket and the current branch, answered by a host-side bridge.
+// ONE ticket and its branch across the checkout and its submodules,
+// answered by a host-side bridge.
 //
 // Installed in the guest as /usr/local/bin/msb-gitlab-mcp and registered
 // with the agent by the launcher when --gitlab-issue is used. The host
-// side is gitlab_bridge.py; it decides which project, issue and branch
-// are involved, so no tool takes a ticket, project or branch argument.
+// side is gitlab_bridge.py; it decides which projects, issue and branch
+// are involved, so no tool takes a ticket, project or branch argument
+// (a repo is chosen only from the list the host built at startup).
 //
 // Requests are files in $MSB_GITLAB_DIR: this writes .ID.tmp, renames
 // it to ID.req (JSON), then waits for ID.done or ID.err.
@@ -22,6 +24,10 @@ const readline = require("readline");
 const dir = process.env.MSB_GITLAB_DIR || "";
 const issue = process.env.MSB_GITLAB_ISSUE || "the assigned ticket";
 
+const repoProp = {
+  type: "string",
+  description: "Repository path as listed by gitlab_status (e.g. libs/foo). Optional when only one repository is set up.",
+};
 const bodySchema = {
   type: "object",
   properties: { body: { type: "string", description: "Comment text (Markdown)." } },
@@ -30,6 +36,15 @@ const bodySchema = {
 const noArgs = { type: "object", properties: {} };
 
 const TOOLS = [
+  {
+    name: "gitlab_status",
+    op: "status",
+    description:
+      `Show where your work on ${issue} stands: each repository (the checkout and its submodules) with its ` +
+      "project, whether it has commits on the ticket branch, and its merge request. Repositories listed as " +
+      "not set up must not be changed.",
+    inputSchema: noArgs,
+  },
   {
     name: "gitlab_get_issue",
     op: "get_issue",
@@ -47,28 +62,58 @@ const TOOLS = [
   {
     name: "gitlab_get_merge_request",
     op: "get_merge_request",
-    description: "Read the open merge request for the branch you are working on (if any), including comments.",
-    inputSchema: noArgs,
+    description: "Read the open merge request for the ticket branch in one repository (if any), including comments.",
+    inputSchema: { type: "object", properties: { repo: repoProp } },
   },
   {
     name: "gitlab_comment_merge_request",
     op: "comment_merge_request",
-    description: "Add a comment to the open merge request for your current branch.",
-    inputSchema: bodySchema,
+    description: "Add a comment to the open merge request for the ticket branch in one repository.",
+    inputSchema: {
+      type: "object",
+      properties: { repo: repoProp, body: bodySchema.properties.body },
+      required: ["body"],
+    },
   },
   {
-    name: "gitlab_submit_merge_request",
-    op: "submit_merge_request",
-    timeout: 300,
+    name: "gitlab_submit_merge_requests",
+    op: "submit_merge_requests",
+    timeout: 600,
     description:
-      "Submit your work: the host pushes your current branch (commit first; uncommitted changes are not sent) " +
-      "and opens a merge request for it against the project's default branch. If one is already open, it is " +
-      "updated with your new commits. You have no git credentials, so do not try to push yourself.",
+      "Submit your work once it is committed: the host pushes the ticket branch of every repository that has " +
+      "commits on it and opens a merge request for each (or updates the one already open), then links them to " +
+      "each other and to the ticket. Uncommitted changes are not sent, repositories without commits get " +
+      "nothing, and a branch that changes submodule pointers is refused. You have no git credentials, so do " +
+      "not try to push yourself. Use `requires` only where one repository's change cannot work without " +
+      "another's (a real functional dependency, with a one-line reason), never for a submodule pointer update; " +
+      "everything else is listed as related automatically.",
     inputSchema: {
       type: "object",
       properties: {
-        title: { type: "string", description: "Merge request title (one line)." },
+        title: { type: "string", description: "Merge request title (one line), used for every repository unless overridden." },
         description: { type: "string", description: "What changed and why (Markdown). Optional." },
+        overrides: {
+          type: "array",
+          description: "Optional per-repository title or description.",
+          items: {
+            type: "object",
+            properties: { repo: repoProp, title: { type: "string" }, description: { type: "string" } },
+            required: ["repo"],
+          },
+        },
+        requires: {
+          type: "array",
+          description: "Optional functional dependencies between repositories that have commits.",
+          items: {
+            type: "object",
+            properties: {
+              repo: { type: "string", description: "The repository whose merge request depends on another." },
+              needs: { type: "string", description: "The repository whose change it depends on." },
+              reason: { type: "string", description: "One line: why it cannot work without it." },
+            },
+            required: ["repo", "needs", "reason"],
+          },
+        },
       },
       required: ["title"],
     },
@@ -86,7 +131,7 @@ async function request(tool, args, timeoutSeconds) {
   const tmp = path.join(dir, `.${id}.tmp`);
   const payload = { op: tool.op };
   for (const k of Object.keys(tool.inputSchema.properties)) {
-    if (typeof args[k] === "string") payload[k] = args[k];
+    if (args[k] !== undefined && args[k] !== null) payload[k] = args[k];
   }
   fs.writeFileSync(tmp, JSON.stringify(payload));
   fs.renameSync(tmp, req);

@@ -6,23 +6,35 @@ The sandbox never gets GitLab credentials or network access to GitLab.
 Instead a guest client (msb-gitlab-mcp) drops request files into a
 directory shared through the mounted workspace, and this bridge, running
 on the host with the user's token, performs a small fixed set of
-operations bound to ONE issue and ONE branch chosen by the user at
-startup:
+operations bound to ONE issue and ONE branch name chosen by the user:
 
-    get_issue                 read the issue and its comments
-    comment_issue             add a comment to that issue
-    get_merge_request         read the open MR for the branch (and comments)
-    comment_merge_request     add a comment to that MR
-    submit_merge_request      push the branch and open an MR (or, if one
-                              is open, just push the new commits)
+    gitlab_bridge.py prepare   before the sandbox: check config, token and
+                               issue, work out the repos (the checkout and
+                               its submodules) and create the branch in
+                               each, writing the pinned session state
+    gitlab_bridge.py serve     answer the guest's requests
+    gitlab_bridge.py finish    after the agent: tidy unused branches and
+                               report what was left behind
+
+Operations the agent can request:
+
+    status                     the repos, their branches and MRs
+    get_issue / comment_issue  the one ticket
+    get_merge_request /
+    comment_merge_request      the MR of one repo's branch
+    submit_merge_requests      push the branch of every repo that has
+                               commits and open (or update) its MR, then
+                               link the MRs to each other and the ticket
 
 Requests never name a project, issue, branch or URL; everything that
 could redirect the token or widen access comes from host-side state:
 
   * config:  ~/.config/msb-agent/gitlab.json (not visible to the sandbox)
-  * repo:    the origin remote read once at startup (see below)
+  * repos:   the checkout and submodules found at startup (gitlab_repos.py)
   * issue:   the --issue argument
-  * branch:  the branch checked out at startup
+  * branch:  --branch, or the root's feature branch, or <iid>-<title slug>
+
+A request may name a repo only as a path from that startup list.
 
 Config (JSON):
 
@@ -39,8 +51,10 @@ Config (JSON):
       "repos": {
         "/abs/path/to/checkout": {
           "instance": "git.example.com",
-          "project": "group/app",                # where MRs are opened
-          "issue_project": "group/tracker"       # where issues live
+          "project": "group/app",                # where the root's MR goes
+          "issue_project": "group/tracker",      # where issues live
+          "working_set": ["group/ui-*"],         # submodules to check out and branch
+          "submodules": {"libs/x": "group/x"}    # optional path -> project overrides
         }
       }
     }
@@ -48,14 +62,14 @@ Config (JSON):
 Without a "repos" entry the project is taken from the origin remote and
 the instance from the remote's host, which must be a configured
 instance, so the token is only ever sent to hosts the user set up. The
-token needs the "api" and "write_repository" scopes (a project access
-token with the Developer role is enough).
+token needs the "api" and "write_repository" scopes (a group access
+token covers every project).
 
 Pushing runs git against a scratch repository that borrows the
 checkout's objects through objects/info/alternates. The checkout's own
 .git/config and hooks, which the agent can edit, are never consulted.
-Branches are pushed without force, never to the project's default or a
-protected branch.
+Branches are pushed without force, never to a default or protected
+branch, and never with submodule pointer changes.
 
 Requests are files: a client writes DIR/.ID.tmp, renames it to ID.req
 (JSON, {"op": ..., ...}) and waits for ID.done (result text) or ID.err.
@@ -64,257 +78,38 @@ since the directory is writable by the sandbox.
 """
 
 import argparse
-import base64
 import json
 import os
 import re
 import secrets
-import shutil
-import ssl
 import stat
-import subprocess
 import sys
-import tempfile
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 
-DEFAULT_CONFIG = os.path.join(
-    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
-    "msb-agent", "gitlab.json")
+from gitlab_common import (
+    BridgeError, DEFAULT_CONFIG, analyse_branch, git, git_net_args,
+    read_head, scratch_repo,
+)
+import gitlab_repos
+from gitlab_repos import Session
 
 REQUEST_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}\.req$")
-PROJECT_RE = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+$")
-BRANCH_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]{0,199}$")
-HASH_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_PENDING = 20
 MAX_BODY = 20000
 MAX_TITLE = 255
+MAX_REASON = 200
+MAX_LIST = 30
 MAX_DESCRIPTION_SHOWN = 20000
 MAX_NOTE_SHOWN = 4000
 MAX_NOTES_SHOWN = 50
 
 FOOTER = "\n\n---\n_Posted by an AI coding agent working in a sandbox (msb-agent)._"
-
-
-class BridgeError(Exception):
-    """An error whose message is safe to show the agent."""
-
-
-# ----------------------------------------------------------------
-# Configuration and target resolution (host side, trusted)
-# ----------------------------------------------------------------
-
-def load_config(path):
-    try:
-        with open(path) as f:
-            cfg = json.load(f)
-    except FileNotFoundError:
-        return {}
-    except (OSError, ValueError) as e:
-        raise BridgeError(f"cannot read {path}: {e}")
-    if not isinstance(cfg, dict):
-        raise BridgeError(f"{path}: expected a JSON object")
-    return cfg
-
-
-def parse_remote(url):
-    """Return (host, path) from an ssh, scp-like or http(s) remote URL."""
-    url = url.strip()
-    m = re.match(r"^(?:[\w.-]+@)?([\w.-]+):(?!//)(.+)$", url)
-    if m and "://" not in url:
-        host, path = m.group(1), m.group(2)
-    else:
-        u = urllib.parse.urlparse(url)
-        host, path = u.hostname, u.path
-    if not host:
-        raise BridgeError(f"cannot parse remote URL {url!r}")
-    path = path.strip("/")
-    if path.endswith(".git"):
-        path = path[:-4]
-    return host.lower(), path
-
-
-def find_instance(cfg, host):
-    for key, inst in (cfg.get("instances") or {}).items():
-        base = inst.get("url") or f"https://{key}"
-        if host in (key.lower(), (urllib.parse.urlparse(base).hostname or "").lower()):
-            return key, inst
-    return None, None
-
-
-def read_token(key, inst):
-    if inst.get("token_env"):
-        token = os.environ.get(inst["token_env"], "")
-    elif inst.get("token_file"):
-        path = os.path.expanduser(inst["token_file"])
-        try:
-            if os.stat(path).st_mode & 0o077:
-                raise BridgeError(f"{path} must not be readable by group/others (chmod 600)")
-            with open(path) as f:
-                token = f.read()
-        except OSError as e:
-            raise BridgeError(f"cannot read token file {path}: {e}")
-    elif inst.get("token_keychain"):
-        try:
-            token = subprocess.run(
-                ["security", "find-generic-password", "-s", inst["token_keychain"],
-                 "-a", os.environ.get("USER", ""), "-w"],
-                capture_output=True, text=True, check=True).stdout
-        except (OSError, subprocess.CalledProcessError):
-            raise BridgeError(f"no Keychain item {inst['token_keychain']!r} for instance {key}")
-    else:
-        raise BridgeError(f"instance {key} needs token_file, token_env or token_keychain")
-    token = token.strip()
-    if not token:
-        raise BridgeError(f"empty token for instance {key}")
-    return token
-
-
-def git_read(common_dir, *args):
-    """Run a read-only git query with no user/system config."""
-    env = {"PATH": os.environ.get("PATH", ""), "GIT_CONFIG_GLOBAL": os.devnull,
-           "GIT_CONFIG_NOSYSTEM": "1"}
-    r = subprocess.run(["git", "--git-dir", common_dir] + list(args),
-                       capture_output=True, text=True, env=env)
-    return r.stdout.strip() if r.returncode == 0 else ""
-
-
-def current_branch(git_dir):
-    try:
-        with open(os.path.join(git_dir, "HEAD")) as f:
-            head = f.read().strip()
-    except OSError as e:
-        raise BridgeError(f"cannot read HEAD: {e}")
-    if not head.startswith("ref: refs/heads/"):
-        raise BridgeError("HEAD is detached; check out a branch first")
-    branch = head[len("ref: refs/heads/"):]
-    if not BRANCH_RE.match(branch) or ".." in branch or branch.endswith((".lock", "/")):
-        raise BridgeError(f"unsupported branch name {branch!r}")
-    return branch
-
-
-def parse_issue(spec):
-    """Return (project or None, iid) from 32, #32, group/proj#32 or an issue URL."""
-    spec = spec.strip()
-    m = re.search(r"^(?:https?://[^/]+/)(.+?)/-/issues/(\d+)", spec)
-    if m:
-        return m.group(1), int(m.group(2))
-    m = re.match(r"^(?:([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+))?#?(\d+)$", spec)
-    if not m or (m.group(1) and "#" not in spec):
-        raise BridgeError(f"cannot parse issue {spec!r} (use 32, group/project#32 or an issue URL)")
-    return m.group(1), int(m.group(2))
-
-
-class Target:
-    """Everything the agent may act on, fixed at startup."""
-
-    def __init__(self, args):
-        cfg = load_config(args.config)
-        repo_cfg = {}
-        for key, val in (cfg.get("repos") or {}).items():
-            real = os.path.realpath(os.path.expanduser(key))
-            if real in (os.path.realpath(args.repo), os.path.realpath(args.primary or args.repo)):
-                repo_cfg = val
-                break
-
-        remote = git_read(args.git_common, "config", "--get", "remote.origin.url")
-        remote_host = remote_path = None
-        if remote:
-            remote_host, remote_path = parse_remote(remote)
-
-        inst_key = repo_cfg.get("instance")
-        if inst_key:
-            inst = (cfg.get("instances") or {}).get(inst_key)
-            if inst is None:
-                raise BridgeError(f"repos entry names unknown instance {inst_key!r}")
-        elif remote_host:
-            inst_key, inst = find_instance(cfg, remote_host)
-            if inst is None:
-                raise BridgeError(
-                    f"origin host {remote_host} is not a configured GitLab instance; "
-                    f"add it under \"instances\" in {args.config}")
-        else:
-            raise BridgeError("no origin remote and no repos entry in the GitLab config")
-
-        self.base = (inst.get("url") or f"https://{inst_key}").rstrip("/")
-        self.ca_file = os.path.expanduser(inst["ca_file"]) if inst.get("ca_file") else None
-        self.token = read_token(inst_key, inst)
-
-        project = repo_cfg.get("project")
-        if not project:
-            if not remote_path:
-                raise BridgeError("cannot work out the project: no origin remote")
-            prefix = urllib.parse.urlparse(self.base).path.strip("/")
-            project = remote_path
-            if prefix and project.startswith(prefix + "/") and "://" in remote:
-                project = project[len(prefix) + 1:]
-        self.project = project
-        self.issue_project, self.issue_iid = parse_issue(args.issue)
-        self.issue_project = self.issue_project or repo_cfg.get("issue_project") or project
-
-        for p in (self.project, self.issue_project):
-            if not PROJECT_RE.match(p):
-                raise BridgeError(f"bad project path {p!r}")
-
-        self.git_dir = args.git_dir
-        self.git_common = args.git_common
-        self.branch = current_branch(args.git_dir)
-        self.inst_key = inst_key
-
-    @property
-    def issue_ref(self):
-        return f"{self.issue_project}#{self.issue_iid}"
-
-
-# ----------------------------------------------------------------
-# GitLab API client
-# ----------------------------------------------------------------
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Never follow redirects: the token must not leave the configured host."""
-
-    def redirect_request(self, *a, **k):
-        return None
-
-
-class GitLab:
-    def __init__(self, target):
-        self.t = target
-        ctx = ssl.create_default_context(cafile=target.ca_file)
-        self.opener = urllib.request.build_opener(
-            _NoRedirect, urllib.request.HTTPSHandler(context=ctx))
-
-    def call(self, method, path, params=None, body=None):
-        url = f"{self.t.base}/api/v4{path}"
-        if params:
-            url += "?" + urllib.parse.urlencode(params)
-        data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method, headers={
-            "PRIVATE-TOKEN": self.t.token, "Content-Type": "application/json",
-            "User-Agent": "msb-agent-gitlab-bridge"})
-        try:
-            with self.opener.open(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8", "replace") or "null")
-        except urllib.error.HTTPError as e:
-            detail = ""
-            try:
-                msg = json.loads(e.read().decode("utf-8", "replace"))
-                detail = msg.get("message") or msg.get("error") or ""
-                if not isinstance(detail, str):
-                    detail = json.dumps(detail)
-            except ValueError:
-                pass
-            raise BridgeError(f"GitLab {method} {path.split('?')[0]} failed: "
-                              f"HTTP {e.code} {detail[:300]}".strip())
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            raise BridgeError(f"cannot reach GitLab: {getattr(e, 'reason', e)}")
-
-    def project_path(self, project):
-        return "/projects/" + urllib.parse.quote(project, safe="")
+LINKS_START = "<!-- msb-agent:links:start -->"
+LINKS_END = "<!-- msb-agent:links:end -->"
+ISSUE_MARK = "<!-- msb-agent:merge-requests -->"
 
 
 # ----------------------------------------------------------------
@@ -351,56 +146,135 @@ def format_notes(notes):
     return "\n".join(out)
 
 
+def one_line(text, limit):
+    text = re.sub(r"\s+", " ", text).replace("<!--", "").replace("-->", "").strip()
+    return text[:limit]
+
+
+def links_section(issue_ref, requires, related):
+    """The managed block of an MR description. requires: [(ref, reason)], related: [(ref, path)]."""
+    lines = [LINKS_START, f"Related to {issue_ref}"]
+    if requires:
+        lines += ["", "Requires:"] + [f"- {ref}: {reason}" for ref, reason in requires]
+    needed = {ref for ref, _ in requires}
+    others = [(ref, path) for ref, path in related if ref not in needed]
+    if others:
+        lines += ["", "Related merge requests:"] + [f"- {ref} ({path})" for ref, path in others]
+    lines.append(LINKS_END)
+    return "\n".join(lines)
+
+
+def replace_links(description, section):
+    description = description or ""
+    pattern = re.compile(re.escape(LINKS_START) + r".*?" + re.escape(LINKS_END), re.S)
+    if pattern.search(description):
+        return pattern.sub(lambda m: section, description)
+    return description.rstrip() + ("\n\n" if description.strip() else "") + section
+
+
+# ----------------------------------------------------------------
+# Pushing, isolated from the (agent-writable) checkout's config
+# ----------------------------------------------------------------
+
+def push_branch(inst, r, branch, tip):
+    with scratch_repo(r["common"], {f"refs/heads/{branch}": tip}) as repo:
+        rc, out, err = git(
+            ["--git-dir", repo] + git_net_args()
+            + ["push", "--no-verify", "--porcelain", inst.repo_url(r["project"]),
+               f"refs/heads/{branch}:refs/heads/{branch}"],
+            env=inst.git_net_env(), timeout=300, secrets=inst)
+    if rc:
+        raise BridgeError(f"git push of {r['path']} failed (not forced): "
+                          f"{(out + err).strip()[-500:]}")
+
+
 # ----------------------------------------------------------------
 # Operations
 # ----------------------------------------------------------------
 
 class Bridge:
-    def __init__(self, target, max_writes):
-        self.t = target
-        self.gl = GitLab(target)
+    def __init__(self, session, max_writes):
+        self.s = session
+        self.gl = session.gl
         self.writes_left = max_writes
 
     # -- helpers ---------------------------------------------------
 
+    @property
+    def branch(self):
+        return self.s.branch
+
     def _issue_path(self):
-        return f"{self.gl.project_path(self.t.issue_project)}/issues/{self.t.issue_iid}"
+        issue = self.s.issue
+        return f"{self.gl.project_path(issue['project'])}/issues/{issue['iid']}"
 
     def _spend_write(self):
         if self.writes_left <= 0:
             raise BridgeError("write limit for this session reached; ask the user to continue")
         self.writes_left -= 1
 
-    def _check_branch(self):
-        """The session is bound to the branch checked out at startup."""
-        try:
-            now = current_branch(self.t.git_dir)
-        except BridgeError as e:
-            now = f"({e})"
-        if now != self.t.branch:
-            raise BridgeError(
-                f"this session is bound to branch {self.t.branch}, but the checkout is now on "
-                f"{now}. Nothing was sent to GitLab. Switching branches is not supported: "
-                f"tell the user, who needs to restart the agent on the right branch.")
+    def _repo(self, req):
+        ready = self.s.ready()
+        path = req.get("repo")
+        names = ", ".join(r["path"] for r in ready) or "(none are set up)"
+        if path in (None, ""):
+            if len(ready) == 1:
+                return ready[0]
+            raise BridgeError(f"say which repo (the 'repo' argument); one of: {names}")
+        for r in ready:
+            if r["path"] == path:
+                return r
+        raise BridgeError(f"unknown repo {path!r}; one of: {names}")
 
-    def _open_mr(self):
-        mrs = self.gl.call("GET", f"{self.gl.project_path(self.t.project)}/merge_requests",
-                           {"source_branch": self.t.branch, "state": "opened"})
+    def _open_mr(self, r):
+        mrs = self.gl.call("GET", f"{self.gl.project_path(r['project'])}/merge_requests",
+                           {"source_branch": self.branch, "state": "opened"})
         for mr in mrs or []:
             if mr.get("source_project_id") == mr.get("target_project_id"):
                 return mr
         return None
 
     @staticmethod
-    def _body(req, key="body"):
-        body = req.get(key)
-        if not isinstance(body, str) or not body.strip():
+    def _text(req, key, limit=MAX_BODY, required=True):
+        value = req.get(key)
+        if value is None and not required:
+            return ""
+        if not isinstance(value, str) or (required and not value.strip()):
             raise BridgeError(f"'{key}' must be non-empty text")
-        if len(body) > MAX_BODY:
-            raise BridgeError(f"'{key}' is too long ({len(body)} > {MAX_BODY} characters)")
-        return body.strip()
+        if len(value) > limit:
+            raise BridgeError(f"'{key}' is too long ({len(value)} > {limit} characters)")
+        return value.strip()
 
-    # -- operations ------------------------------------------------
+    # -- reading ---------------------------------------------------
+
+    def status(self, req):
+        lines = [f"Ticket {self.s.issue['ref']}; branch {self.branch}", ""]
+        for r in self.s.repos:
+            head = f"- {r['path']} ({r['project']}): "
+            if r["status"] != "ready":
+                lines.append(head + f"not set up ({r['reason']})")
+                continue
+            try:
+                kind, val = read_head(r["gitdir"])
+                on = f"on {val}" if kind == "branch" else f"detached at {val[:10]}"
+                a = analyse_branch(r["common"], self.branch, r["default_branch"])
+            except BridgeError as e:
+                lines.append(head + f"error: {e}")
+                continue
+            if not a or not a["ahead"]:
+                lines.append(head + f"checkout {on}; no commits on {self.branch} yet (no merge request)")
+                continue
+            text = head + f"checkout {on}; {a['ahead']} commit(s) on {self.branch}"
+            if a["pointers"]:
+                text += (f"; CONTAINS SUBMODULE POINTER CHANGES ({', '.join(a['pointers'][:3])}) "
+                         "which must be removed before submitting")
+            mr = self._open_mr(r)
+            text += f"; merge request: {mr['web_url']}" if mr else "; no merge request yet"
+            sub = r.get("submitted") or {}
+            if mr and sub.get("sha") not in (None, a["tip"]):
+                text += " (newer commits not pushed yet)"
+            lines.append(text)
+        return "\n".join(lines)
 
     def get_issue(self, req):
         path = self._issue_path()
@@ -409,7 +283,7 @@ class Bridge:
             "per_page": 100, "sort": "asc", "order_by": "created_at"})
         who = user_name(issue.get("author"))
         head = [
-            f"Issue {self.t.issue_ref}: {issue.get('title', '')}",
+            f"Issue {self.s.issue['ref']}: {issue.get('title', '')}",
             f"URL: {issue.get('web_url', '')}",
             f"State: {issue.get('state', '')}  Author: @{who}  "
             f"Assignees: {', '.join('@' + user_name(a) for a in issue.get('assignees', [])) or 'none'}",
@@ -421,24 +295,18 @@ class Bridge:
         ]
         return "\n".join(head)
 
-    def comment_issue(self, req):
-        body = self._body(req)
-        self._spend_write()
-        note = self.gl.call("POST", self._issue_path() + "/notes", body={"body": body + FOOTER})
-        return f"Comment posted on issue {self.t.issue_ref} (note {note.get('id')})."
-
     def get_merge_request(self, req):
-        self._check_branch()
-        mr = self._open_mr()
+        r = self._repo(req)
+        mr = self._open_mr(r)
         if mr is None:
-            return (f"No open merge request for branch {self.t.branch} in {self.t.project}. "
-                    "Use submit_merge_request when the work is ready.")
+            return (f"No open merge request for {self.branch} in {r['project']}. "
+                    "Use gitlab_submit_merge_requests when the work is ready.")
         who = user_name(mr.get("author"))
         notes = self.gl.call(
-            "GET", f"{self.gl.project_path(self.t.project)}/merge_requests/{mr['iid']}/notes",
+            "GET", f"{self.gl.project_path(r['project'])}/merge_requests/{mr['iid']}/notes",
             {"per_page": 100, "sort": "asc", "order_by": "created_at"})
         return "\n".join([
-            f"Merge request {self.t.project}!{mr['iid']}: {mr.get('title', '')}",
+            f"Merge request {r['project']}!{mr['iid']}: {mr.get('title', '')}",
             f"URL: {mr.get('web_url', '')}",
             f"State: {mr.get('state', '')}  Author: @{who}  "
             f"{mr.get('source_branch')} -> {mr.get('target_branch')}  "
@@ -447,151 +315,185 @@ class Bridge:
             "", format_notes(notes or []),
         ])
 
+    # -- commenting ------------------------------------------------
+
+    def comment_issue(self, req):
+        body = self._text(req, "body")
+        self._spend_write()
+        note = self.gl.call("POST", self._issue_path() + "/notes", body={"body": body + FOOTER})
+        return f"Comment posted on issue {self.s.issue['ref']} (note {note.get('id')})."
+
     def comment_merge_request(self, req):
-        body = self._body(req)
-        self._check_branch()
-        mr = self._open_mr()
+        body = self._text(req, "body")
+        r = self._repo(req)
+        mr = self._open_mr(r)
         if mr is None:
-            raise BridgeError(f"no open merge request for branch {self.t.branch}; submit one first")
+            raise BridgeError(f"no open merge request for {self.branch} in {r['project']}; "
+                              "submit one first")
         self._spend_write()
         note = self.gl.call(
-            "POST", f"{self.gl.project_path(self.t.project)}/merge_requests/{mr['iid']}/notes",
+            "POST", f"{self.gl.project_path(r['project'])}/merge_requests/{mr['iid']}/notes",
             body={"body": body + FOOTER})
-        return f"Comment posted on merge request !{mr['iid']} (note {note.get('id')})."
+        return f"Comment posted on merge request {r['project']}!{mr['iid']} (note {note.get('id')})."
 
-    def submit_merge_request(self, req):
-        title = req.get("title")
-        if not isinstance(title, str) or not title.strip() or "\n" in title.strip():
+    # -- submitting ------------------------------------------------
+
+    def _plan(self, req):
+        """Validate everything first; return the repos to submit. Nothing is sent on error."""
+        title = self._text(req, "title", MAX_TITLE)
+        if "\n" in title:
             raise BridgeError("'title' must be a single line of text")
-        title = title.strip()
-        if len(title) > MAX_TITLE:
-            raise BridgeError(f"'title' is too long (max {MAX_TITLE} characters)")
-        description = req.get("description") or ""
-        if not isinstance(description, str) or len(description) > MAX_BODY:
-            raise BridgeError(f"'description' must be text of at most {MAX_BODY} characters")
+        description = self._text(req, "description", required=False)
 
-        self._check_branch()
-        proj = self.gl.project_path(self.t.project)
-        info = self.gl.call("GET", proj)
-        target = info.get("default_branch")
-        branch = self.t.branch
-        if not target:
-            raise BridgeError(f"{self.t.project} has no default branch (is it empty?)")
-        if branch == target:
-            raise BridgeError(f"refusing to push {branch}: it is the project's default branch. "
-                              "Work on a feature branch.")
+        overrides = req.get("overrides") or []
+        requires = req.get("requires") or []
+        if not isinstance(overrides, list) or not isinstance(requires, list) \
+                or len(overrides) > MAX_LIST or len(requires) > MAX_LIST:
+            raise BridgeError("'overrides' and 'requires' must be short lists")
+
+        errors, touched = [], []
+        for r in self.s.ready():
+            try:
+                a = analyse_branch(r["common"], self.branch, r["default_branch"])
+            except BridgeError as e:
+                errors.append(f"{r['path']}: {e}")
+                continue
+            if not a or not a["ahead"]:
+                continue
+            if r["default_branch"] == self.branch:
+                errors.append(f"{r['path']}: {self.branch} is the default branch")
+            if a["pointers"]:
+                errors.append(
+                    f"{r['path']}: {self.branch} changes submodule pointers "
+                    f"({', '.join(a['pointers'][:5])}); pointer updates must not be in a merge "
+                    f"request. Undo them in a new commit or rewrite the branch, then submit again")
+            try:
+                self.gl.call("GET", f"{self.gl.project_path(r['project'])}/protected_branches/"
+                                    f"{urllib.parse.quote(self.branch, safe='')}")
+                errors.append(f"{r['path']}: {self.branch} is a protected branch in {r['project']}")
+            except BridgeError as e:
+                if "HTTP 404" not in str(e) and "HTTP 403" not in str(e):
+                    errors.append(f"{r['path']}: {e}")
+            touched.append((r, a))
+
+        paths = {r["path"] for r, _ in touched}
+        own = {}
+        for o in overrides:
+            if not isinstance(o, dict) or o.get("repo") not in paths:
+                errors.append(f"overrides: {o.get('repo') if isinstance(o, dict) else o!r} "
+                              f"is not a repo with commits to submit (those are: {sorted(paths)})")
+                continue
+            body = o.get("description")
+            own[o["repo"]] = {
+                "title": self._text(o, "title", MAX_TITLE, required=False) or title,
+                "description": body.strip() if isinstance(body, str) and body.strip() else description}
+        deps = {}
+        for q in requires:
+            ok = (isinstance(q, dict) and q.get("repo") in paths and q.get("needs") in paths
+                  and q["repo"] != q["needs"] and isinstance(q.get("reason"), str)
+                  and q["reason"].strip())
+            if not ok:
+                errors.append("requires: each entry needs 'repo', 'needs' (both repos with commits "
+                              f"to submit: {sorted(paths)}) and a 'reason'")
+                continue
+            deps.setdefault(q["repo"], []).append((q["needs"], one_line(q["reason"], MAX_REASON)))
+
+        if errors:
+            raise BridgeError("nothing was sent:\n- " + "\n- ".join(errors))
+        return title, description, own, deps, touched
+
+    def submit_merge_requests(self, req):
+        title, description, own, deps, touched = self._plan(req)
+        if not touched:
+            return (f"No repository has commits on {self.branch} beyond its default branch, "
+                    "so there is nothing to submit.")
+
+        results, mrs = {}, {}
+        for r, a in touched:
+            path = r["path"]
+            try:
+                self._spend_write()
+                push_branch(self.s.inst, r, self.branch, a["tip"])
+                mr = self._open_mr(r)
+                if mr is None:
+                    cfg = own.get(path, {})
+                    mr = self.gl.call(
+                        "POST", f"{self.gl.project_path(r['project'])}/merge_requests", body={
+                            "source_branch": self.branch, "target_branch": r["default_branch"],
+                            "title": cfg.get("title", title),
+                            "description": cfg.get("description", description)})
+                    results[path] = f"opened {mr.get('web_url')}"
+                else:
+                    results[path] = f"updated {mr.get('web_url')}"
+                mrs[path] = mr
+                r["submitted"] = {"sha": a["tip"], "mr": mr.get("web_url", "")}
+                self.s.save()
+            except BridgeError as e:
+                results[path] = f"FAILED: {e}"
+
+        self._link(touched, mrs, deps)
+        report = [f"Branch {self.branch}:"]
+        report += [f"- {r['path']} ({r['project']}): {results[r['path']]}" for r, _ in touched]
+        for r, _ in touched:
+            try:
+                kind, val = read_head(r["gitdir"])
+            except BridgeError:
+                continue
+            if r["path"] in mrs and (kind, val) != ("branch", self.branch):
+                report.append(f"note: {r['path']} is checked out on {val}, not {self.branch}")
+        if any(v.startswith("FAILED") for v in results.values()):
+            raise BridgeError("some repos failed (submitting again retries them):\n"
+                              + "\n".join(report))
+        return "\n".join(report)
+
+    def _link(self, touched, mrs, deps):
+        """Add the managed cross-reference block to each MR and update the issue's list."""
+        refs = {r["path"]: f"{r['project']}!{mrs[r['path']]['iid']}"
+                for r, _ in touched if r["path"] in mrs}
+        for r, _ in touched:
+            path = r["path"]
+            if path not in mrs:
+                continue
+            mr = mrs[path]
+            related = [(refs[p], p) for p in refs if p != path]
+            requires = [(refs[need], reason) for need, reason in deps.get(path, []) if need in refs]
+            section = links_section(self.s.issue["ref"], requires, related)
+            new = replace_links(mr.get("description") or "", section)
+            if new != (mr.get("description") or ""):
+                try:
+                    self._spend_write()
+                    self.gl.call("PUT", f"{self.gl.project_path(r['project'])}/merge_requests/"
+                                        f"{mr['iid']}", body={"description": new})
+                except BridgeError as e:
+                    print(f"links on {path}: {e}", file=sys.stderr, flush=True)
+
+        lines = [ISSUE_MARK, f"Merge requests for branch `{self.branch}`:"]
+        lines += [f"- {refs[r['path']]} ({r['path']}): {mrs[r['path']].get('title', '')}"
+                  for r, _ in touched if r["path"] in refs]
+        body = "\n".join(lines) + FOOTER
         try:
-            self.gl.call("GET", f"{proj}/protected_branches/{urllib.parse.quote(branch, safe='')}")
-            raise BridgeError(f"refusing to push {branch}: it is a protected branch")
+            path = self._issue_path()
+            me = self.gl.me().get("id")
+            existing = None
+            for page in range(1, 6):
+                notes = self.gl.call("GET", path + "/notes", {"per_page": 100, "page": page})
+                for n in notes or []:
+                    if ISSUE_MARK in (n.get("body") or "") and (n.get("author") or {}).get("id") == me:
+                        existing = n
+                if existing or not notes or len(notes) < 100:
+                    break
+            self._spend_write()
+            if existing:
+                self.gl.call("PUT", f"{path}/notes/{existing['id']}", body={"body": body})
+            else:
+                self.gl.call("POST", path + "/notes", body={"body": body})
         except BridgeError as e:
-            if "HTTP 404" not in str(e) and "HTTP 403" not in str(e):
-                raise
-
-        self._spend_write()
-        pushed = push_branch(self.t, branch)
-
-        mr = self._open_mr()
-        if mr is not None:
-            return (f"Pushed {branch}. Merge request !{mr['iid']} is already open and now "
-                    f"includes the new commits: {mr.get('web_url')}\n{pushed}")
-
-        closes = (f"Closes #{self.t.issue_iid}" if self.t.issue_project == self.t.project
-                  else f"Closes {self.t.issue_ref}")
-        description = (description.strip() + "\n\n" if description.strip() else "") + closes + FOOTER
-        mr = self.gl.call("POST", f"{proj}/merge_requests", body={
-            "source_branch": branch, "target_branch": target,
-            "title": title, "description": description})
-        return (f"Pushed {branch} and opened merge request !{mr['iid']} "
-                f"({branch} -> {target}): {mr.get('web_url')}\n{pushed}")
+            print(f"issue note: {e}", file=sys.stderr, flush=True)
 
 
-OPS = ("get_issue", "comment_issue", "get_merge_request",
-       "comment_merge_request", "submit_merge_request")
-
-
-# ----------------------------------------------------------------
-# Pushing, isolated from the (agent-writable) checkout's config
-# ----------------------------------------------------------------
-
-def resolve_branch_tip(common_dir, branch):
-    """Read refs/heads/<branch> from loose refs or packed-refs, without git."""
-    ref = "refs/heads/" + branch
-    path = os.path.join(common_dir, ref)
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        try:
-            if stat.S_ISREG(os.fstat(fd).st_mode):
-                text = os.read(fd, 256).decode("ascii", "replace").strip()
-                if HASH_RE.match(text):
-                    return text
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
-    try:
-        with open(os.path.join(common_dir, "packed-refs")) as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) == 2 and parts[1] == ref and HASH_RE.match(parts[0]):
-                    return parts[0]
-    except OSError:
-        pass
-    raise BridgeError(f"branch {branch} has no commits yet")
-
-
-def push_branch(target, branch):
-    tip = resolve_branch_tip(target.git_common, branch)
-    objects = os.path.join(target.git_common, "objects")
-    if not os.path.isdir(objects):
-        raise BridgeError("cannot find the repository's object store")
-
-    token = target.token
-    auth = base64.b64encode(f"oauth2:{token}".encode()).decode()
-    url = f"{target.base}/{target.project}.git"
-
-    with tempfile.TemporaryDirectory(prefix="msb-gitlab-push-") as tmp:
-        repo = os.path.join(tmp, "scratch.git")
-        env = {
-            "PATH": os.environ.get("PATH", ""),
-            "HOME": tmp,
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "http.extraHeader",
-            "GIT_CONFIG_VALUE_0": f"Authorization: Basic {auth}",
-        }
-        if target.ca_file:
-            env["GIT_SSL_CAINFO"] = target.ca_file
-
-        def git(*args):
-            r = subprocess.run(["git"] + list(args), capture_output=True, text=True,
-                               env=env, cwd=tmp, timeout=300)
-            return r.returncode, (r.stdout + r.stderr).replace(token, "***").replace(auth, "***")
-
-        rc, out = git("init", "--bare", "--quiet", repo)
-        if rc:
-            raise BridgeError(f"could not prepare push: {out.strip()[:300]}")
-
-        os.makedirs(os.path.join(repo, "objects", "info"), exist_ok=True)
-        with open(os.path.join(repo, "objects", "info", "alternates"), "w") as f:
-            f.write(objects + "\n")
-
-        g = ["--git-dir", repo]
-        rc, out = git(*g, "update-ref", f"refs/heads/{branch}", tip)
-        if rc:
-            raise BridgeError(f"could not prepare push: {out.strip()[:300]}")
-        rc, out = git(*g, "cat-file", "-e", f"{tip}^{{commit}}")
-        if rc:
-            raise BridgeError("the branch tip commit is missing from the object store")
-
-        rc, out = git(*g, "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
-                      "-c", "credential.helper=", "-c", "core.hooksPath=" + os.devnull,
-                      "push", "--no-verify", "--porcelain", url,
-                      f"refs/heads/{branch}:refs/heads/{branch}")
-        if rc:
-            raise BridgeError(f"git push failed (not forced): {out.strip()[-600:]}")
-        return f"git push: ok ({tip[:12]})"
+OPS = ("status", "get_issue", "comment_issue", "get_merge_request",
+       "comment_merge_request", "submit_merge_requests")
+WRITE_OPS = ("comment_issue", "comment_merge_request", "submit_merge_requests")
 
 
 # ----------------------------------------------------------------
@@ -650,8 +552,8 @@ def serve(bridge, req_dir, poll, parent_pid, min_write_interval):
     os.makedirs(req_dir, exist_ok=True)
     dir_fd = os.open(req_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     last_write = 0.0
-    print(f"Ready: issue {bridge.t.issue_ref}, branch {bridge.t.branch} "
-          f"-> {bridge.t.project} on {bridge.t.base}", flush=True)
+    print(f"Ready: issue {bridge.s.issue['ref']}, branch {bridge.branch}, "
+          f"{len(bridge.s.ready())} repo(s) on {bridge.s.inst.base}", flush=True)
 
     while parent_alive(parent_pid):
         try:
@@ -672,7 +574,7 @@ def serve(bridge, req_dir, poll, parent_pid, min_write_interval):
                 op = req.get("op")
                 if op not in OPS:
                     raise BridgeError(f"unknown operation {op!r}")
-                if op in ("comment_issue", "comment_merge_request", "submit_merge_request"):
+                if op in WRITE_OPS:
                     wait = last_write + min_write_interval - time.monotonic()
                     if wait > 0:
                         time.sleep(wait)
@@ -692,50 +594,45 @@ def serve(bridge, req_dir, poll, parent_pid, min_write_interval):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--issue", required=True, help="32, #32, group/project#32 or an issue URL")
-    ap.add_argument("--repo", required=True, help="checkout (worktree) directory")
-    ap.add_argument("--primary", default="", help="primary checkout of a linked worktree")
-    ap.add_argument("--git-dir", required=True, help="absolute git dir of the checkout")
-    ap.add_argument("--git-common", required=True, help="absolute common git dir")
-    ap.add_argument("--config", default=DEFAULT_CONFIG)
-    ap.add_argument("-d", "--dir", help="request directory (required unless --check)")
-    ap.add_argument("--check", action="store_true",
-                    help="validate config and access, print the normalised issue "
-                         "reference and the branch (two lines) on stdout, and exit")
-    ap.add_argument("--poll", type=float, default=0.2)
-    ap.add_argument("--max-writes", type=int, default=40,
-                    help="comments, pushes and MRs allowed per session (default 40)")
-    ap.add_argument("--min-write-interval", type=float, default=2.0)
-    ap.add_argument("--parent-pid", type=int, default=0,
-                    help="exit when this process no longer exists")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("prepare", help="validate, create branches, write session state")
+    p.add_argument("--issue", required=True, help="32, #32, group/project#32 or an issue URL")
+    p.add_argument("--branch", default="", help="branch name (default: the root's feature "
+                   "branch, else <iid>-<title slug>)")
+    p.add_argument("--repo", required=True, help="checkout (worktree) directory")
+    p.add_argument("--primary", default="", help="primary checkout of a linked worktree")
+    p.add_argument("--git-dir", required=True, help="absolute git dir of the checkout")
+    p.add_argument("--git-common", required=True, help="absolute common git dir")
+    p.add_argument("--config", default=DEFAULT_CONFIG)
+    p.add_argument("--state", required=True, help="session state file to write")
+    p.add_argument("--skip-unprepared", action="store_true",
+                   help="without a terminal, skip repos that need a decision instead of aborting")
+
+    p = sub.add_parser("serve", help="answer the sandbox's requests")
+    p.add_argument("--state", required=True)
+    p.add_argument("-d", "--dir", required=True, help="request directory")
+    p.add_argument("--poll", type=float, default=0.2)
+    p.add_argument("--max-writes", type=int, default=80,
+                   help="comments, pushes and MR updates allowed per session (default 80)")
+    p.add_argument("--min-write-interval", type=float, default=2.0)
+    p.add_argument("--parent-pid", type=int, default=0, help="exit when this process is gone")
+
+    p = sub.add_parser("finish", help="tidy up after the agent and report")
+    p.add_argument("--state", required=True)
+
     args = ap.parse_args()
-
-    if not args.check and not args.dir:
-        ap.error("--dir is required unless --check is given")
-
     try:
-        target = Target(args)
-        bridge = Bridge(target, args.max_writes)
-
-        # Verify access now so mistakes surface before the sandbox is set up.
-        issue = bridge.gl.call("GET", bridge._issue_path())
-        default = bridge.gl.call("GET", bridge.gl.project_path(target.project)).get("default_branch")
-        if target.branch in (default, "main", "master"):
-            raise BridgeError(
-                f"the checkout is on {target.branch}, which an agent must never push. "
-                f"Check out or create a feature branch for the issue, then start again.")
-        print(f"GitLab {target.base}: issue {target.issue_ref} "
-              f"({issue.get('title', '')!r}); MRs from {target.branch} in {target.project}",
-              file=sys.stderr, flush=True)
+        if args.cmd == "prepare":
+            print(gitlab_repos.prepare(args))
+            return 0
+        if args.cmd == "finish":
+            return gitlab_repos.finish(args.state)
+        bridge = Bridge(Session(args.state), args.max_writes)
+        return serve(bridge, args.dir, args.poll, args.parent_pid, args.min_write_interval)
     except BridgeError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-
-    if args.check:
-        print(target.issue_ref)
-        print(target.branch)
-        return 0
-    return serve(bridge, args.dir, args.poll, args.parent_pid, args.min_write_interval)
 
 
 if __name__ == "__main__":
