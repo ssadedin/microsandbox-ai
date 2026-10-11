@@ -20,6 +20,23 @@ cumbersome. These scripts facilitate some niceties including:
   tools bound to one issue and the current branch, and a host process
   does the work (see below)
 
+## Pi credentials
+
+`pi-msb` resolves model credentials on the host, so the sandbox only ever holds
+placeholders:
+
+- **OpenRouter, OpenAI, Anthropic:** read from a host `pi` install if there is
+  one (`pi auth print-api-key`). Without host pi these are skipped.
+- **Amazon Bedrock:** a short-lived Bedrock API key is minted from a dedicated
+  AWS profile named `pi-msb` in `~/.aws/credentials` or `~/.aws/config` (or the
+  profile named by `PI_MSB_AWS_PROFILE`; `PI_MSB_AWS_REGION` defaults to
+  `ap-southeast-2`). It needs `uv` on the host to sign the token. A dedicated,
+  narrowly scoped profile is deliberate: the key carries that identity's
+  permissions, so your admin profile is never used implicitly.
+
+If neither works the launcher says why ("Bedrock: skipped: ..." before the
+sandbox starts) and pi will ask you to log in inside the sandbox instead.
+
 ## Behind a TLS-intercepting network
 
 If your network re-signs HTTPS with a company root (Zscaler and similar),

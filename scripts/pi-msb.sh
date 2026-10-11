@@ -142,7 +142,9 @@ pi_msb_credentials() {
         if [[ "${PI_MSB_BEDROCK:-1}" == "0" ]]; then
             echo "       Bedrock disabled (PI_MSB_BEDROCK=0)" >&2
         else
-            echo "       Bedrock: configure AWS profile '$bedrock_profile' (PI_MSB_AWS_PROFILE)" >&2
+            echo "       Bedrock needs uv on the host and an AWS profile named '$bedrock_profile'" >&2
+            echo "       (or PI_MSB_AWS_PROFILE=<profile>); see the 'Bedrock: skipped' message above." >&2
+            echo "       Without credentials pi will ask you to log in inside the sandbox." >&2
         fi
     fi
 }
@@ -224,7 +226,7 @@ _pi_msb_bedrock_token() {
     local profile="$1" region="$2" expiry="$3"
 
     command -v uv >/dev/null 2>&1 || {
-        echo "Bedrock: skipped (uv not found; needed to sign token)" >&2
+        echo "Bedrock: skipped: uv not found on the host (it signs the token); install it from https://docs.astral.sh/uv/" >&2
         return 0
     }
 
@@ -248,7 +250,10 @@ profile, region, expiry = sys.argv[1], sys.argv[2], int(sys.argv[3])
 try:
     creds = Session(profile=profile).get_credentials()
 except ProfileNotFound:
-    print(f"Bedrock: skipped (AWS profile '{profile}' not found)", file=sys.stderr)
+    found = ", ".join(sorted(Session().available_profiles)) or "none"
+    print(f"Bedrock: skipped: AWS profile '{profile}' not found (profiles in ~/.aws: {found}).\n"
+          f"         Use a dedicated profile named '{profile}', or choose one with PI_MSB_AWS_PROFILE=<name>.",
+          file=sys.stderr)
     sys.exit(0)
 except BotoCoreError as e:
     print(f"Bedrock: skipped ({e})", file=sys.stderr)
