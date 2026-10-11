@@ -37,6 +37,37 @@ placeholders:
 If neither works the launcher says why ("Bedrock: skipped: ..." before the
 sandbox starts) and pi will ask you to log in inside the sandbox instead.
 
+## Claude credentials
+
+`claude-msb` authenticates with your Claude subscription, using a long-lived
+token from `claude setup-token`. The token stays on the host and is handed to
+`msb` as a secret for `api.anthropic.com`, so the sandbox only ever sees a
+placeholder that `msb` substitutes on requests to that host.
+
+- **First launch:** with no stored token the launcher offers to run
+  `claude setup-token` (needs `claude` on the host; it opens a browser) and
+  asks you to paste the token it prints (`sk-ant-...`, input hidden). Without
+  host `claude`, create one on any machine with `claude setup-token`.
+- **Where it is kept:** the macOS Keychain (service `claude-msb`), or on other
+  systems `~/.config/claude-msb/oauth-token` (mode 600). To replace it, delete
+  that entry and launch again:
+  `security delete-generic-password -s claude-msb` (macOS) or remove the file.
+- **Overrides:** `CLAUDE_MSB_OAUTH_TOKEN` uses a token for one run without
+  storing it. `CLAUDE_MSB_SECRET_OPTS` changes the `msb` secret options (see
+  `msb_agent_add_secret`).
+- **Not supported:** Amazon Bedrock, API keys and Console accounts. Only the
+  subscription token is used (`pi-msb` is the wrapper with Bedrock support).
+
+Other behavior worth knowing: permission prompts are skipped
+(`--dangerously-skip-permissions`; set `CLAUDE_MSB_SKIP_PERMISSIONS=0` to keep
+them), telemetry and error reporting are disabled, and on each launch your
+`~/.claude` `CLAUDE.md`, `settings.json`, `skills`, `agents`, `commands` and
+`output-styles` are copied into the sandbox (`CLAUDE_MSB_SYNC` changes the
+list). From `settings.json`, entries that run host commands (`hooks`,
+`statusLine`, `apiKeyHelper`, ...) are dropped, and the file is not copied at
+all if `jq` is missing on the host. Credentials, history and plugins are
+never copied.
+
 ## Behind a TLS-intercepting network
 
 If your network re-signs HTTPS with a company root (Zscaler and similar),
