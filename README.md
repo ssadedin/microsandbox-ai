@@ -35,46 +35,44 @@ left to right direction
 actor "User" as user
 
 package "Host (trusted)" as host #F4F8FF {
-  component "claude-msb.sh\npi-msb.sh" as entry
-  component "msb-agent-lib.sh\nsandbox lifecycle, network allowlist,\n.env handling, prompt assembly" as lib
-  component "msb\nmicrosandbox runtime:\nTLS interception, allowlist,\nsecret substitution" as msb
-  component "gitlab_bridge.py\nprepare | serve | finish\n(+ gitlab_repos.py, gitlab_common.py)" as bridge
-  component "capture_screenshots.py\n(macOS)" as shots
-  database "Credentials\nKeychain / token file,\n$HOME/.aws profile (signed via uv),\nhost pi" as creds
-  database "Config and state\n$HOME/.config/msb-agent/\n$HOME/.local/state/msb-agent/" as cfg
+  component "claude-msb\npi-msb" as entry
+  component "Launcher" as lib
+  component "msb" as msb
+  component "GitLab bridge" as bridge
+  component "Screenshots" as shots
+  database "Config and\ncredentials" as cfg
 }
 
 package "Sandbox VM (untrusted)" as vm #FFF6F0 {
-  component "Agent\nClaude Code / Pi" as agent
-  component "msb-gitlab-mcp\n(MCP server)" as mcp
-  component "msb-screenshot" as shot
-  folder "/workspace\nthe checkout, or a submodule plus\nits own git dir\n(request files live here)" as ws
+  component "Agent" as agent
+  component "GitLab MCP" as mcp
+  component "Screenshot\ncommand" as shot
+  folder "/workspace" as ws
 }
 
-cloud "LLM providers\nAnthropic, Bedrock,\nOpenRouter, OpenAI" as llm
-cloud "GitLab\nself-hosted or gitlab.com" as gl
-cloud "Allowlisted internet\nDebian mirrors, package\nregistries, GitHub" as net
+cloud "LLM providers" as llm
+cloud "GitLab" as gl
+cloud "Allowlisted\ninternet" as net
 
-user --> entry : run
-entry --> lib : sources
-lib --> msb : create / modify / exec
-lib ..> creds : resolve (never enters VM)
+user --> entry
+entry --> lib
+lib --> msb : create / exec
 lib ..> cfg : read
-lib --> bridge : prepare (prompts),\nstart serve, finish
-lib --> shots : start (optional)
+lib --> bridge
+lib --> shots
 msb --> agent : runs
 
-agent --> mcp : MCP (stdio)
-agent --> shot : command
+agent --> mcp
+agent --> shot
 mcp --> ws : request files
 shot --> ws : request files
-bridge <-- ws : polls request files
-shots <-- ws : polls request files
+bridge <-- ws : polls
+shots <-- ws : polls
 
-agent ..> msb : outbound HTTPS
-msb ..> llm : placeholder replaced\nby the real key
-msb ..> net : allowlisted hosts only
-bridge ..> gl : REST API, git fetch and push\n(token stays on the host)
+agent ..> msb : HTTPS
+msb ..> llm : real key\nsubstituted
+msb ..> net : allowlist
+bridge ..> gl : API, git
 @enduml
 ```
 
