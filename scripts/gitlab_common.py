@@ -297,6 +297,12 @@ class GitLab:
 
 _home = None
 
+# The user's network settings for git: which CA bundle to trust, and any
+# corporate proxy. (Never GIT_SSL_NO_VERIFY or the like.)
+_NET_ENV = ("GIT_SSL_CAINFO", "SSL_CERT_FILE", "SSL_CERT_DIR",
+            "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+            "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy")
+
 
 def _git_env(extra=None):
     global _home
@@ -312,6 +318,11 @@ def _git_env(extra=None):
         "GIT_OPTIONAL_LOCKS": "0",
         "LC_ALL": "C",
     }
+    # These only say which certificates to trust and how to reach the
+    # network (for example behind a TLS-intercepting corporate proxy).
+    for name in _NET_ENV:
+        if name in os.environ:
+            env[name] = os.environ[name]
     env.update(extra or {})
     return env
 

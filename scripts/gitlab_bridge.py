@@ -45,7 +45,7 @@ Config (JSON):
           "token_file": "~/.config/msb-agent/example.token",   # 0600
           "token_env": "EXAMPLE_GITLAB_TOKEN",   # or an env var
           "token_keychain": "msb-gitlab-example",# or a macOS Keychain item
-          "ca_file": "/path/to/internal-ca.pem"  # optional
+          "ca_file": "/path/to/ca-bundle.pem"    # optional; the COMPLETE trust bundle
         }
       },
       "repos": {

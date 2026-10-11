@@ -20,6 +20,37 @@ cumbersome. These scripts facilitate some niceties including:
   tools bound to one issue and the current branch, and a host process
   does the work (see below)
 
+## Behind a TLS-intercepting network
+
+If your network re-signs HTTPS with a company root (Zscaler and similar),
+install that root on the host the normal way (device management, so it is in
+the OS trust store). Then:
+
+- **Inside the sandbox** this is already handled: sandboxes are created with
+  `--trust-host-cas`, and the sandbox's proxy checks upstream certificates
+  against the host's root store.
+- **The base image pull** is done by `msb` on the host and needs the root in
+  msb's own config: set `registries.ca_certs` in `~/.microsandbox/config.json`
+  (see the microsandbox docs, "Configure company networking"). A cached image
+  is not affected.
+- **`uv` on the host** (screenshots, pi's Bedrock login) does not use the OS
+  store by default; export `UV_NATIVE_TLS=1` or `SSL_CERT_FILE=<bundle>`.
+- **The GitLab bridge** keeps `GIT_SSL_CAINFO`, `SSL_CERT_FILE`,
+  `SSL_CERT_DIR` and the usual proxy variables (`HTTPS_PROXY`, `NO_PROXY`, ...)
+  from your environment for its git calls, and your global git config is not
+  read. For an intercepted GitLab host set `ca_file` on the instance (or export
+  `SSL_CERT_FILE`) to a bundle containing the company root *and* the public
+  roots: `ca_file` replaces the default trust, it does not add to it. On macOS:
+
+  ```
+  security find-certificate -a -p \
+      /Library/Keychains/System.keychain \
+      /System/Library/Keychains/SystemRootCertificates.keychain \
+      > ~/.config/msb-agent/ca-bundle.pem
+  ```
+
+  An internal GitLab that the proxy does not inspect needs none of this.
+
 ## Launching inside a submodule
 
 Running a wrapper from inside a submodule scopes the agent to that source
@@ -93,7 +124,7 @@ Instance, token and project mapping live on the host in
     "git.example.com": {
       "url": "https://git.example.com",
       "token_file": "~/.config/msb-agent/example.token",
-      "ca_file": "/path/to/internal-ca.pem"
+      "ca_file": "/path/to/ca-bundle.pem"
     }
   },
   "repos": {
@@ -111,8 +142,8 @@ Instance, token and project mapping live on the host in
 - `token_file` (mode 600), `token_env` or `token_keychain` (macOS) supply the
   token. It needs the `api` and `write_repository` scopes and must reach every
   project involved, so use a group access token (Developer role) or a personal
-  token. `url` defaults to `https://<instance name>`; `ca_file` is for
-  internal CAs. Everything is assumed to live on one instance.
+  token. `url` defaults to `https://<instance name>`; `ca_file` is a
+  complete CA bundle for internal or intercepted hosts (see above). Everything is assumed to live on one instance.
 - `repos` is optional and matches the checkout or, for a linked worktree, its
   primary checkout. Without an entry the project comes from the `origin` remote
   (whose host must be a configured instance) and issues are looked up in the
