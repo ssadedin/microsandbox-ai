@@ -126,6 +126,24 @@ placeholders:
 If neither works the launcher says why ("Bedrock: skipped: ..." before the
 sandbox starts) and pi will ask you to log in inside the sandbox instead.
 
+### Pi skills, extensions and prompts
+
+Nothing from `~/.pi` is copied into the sandbox, because the agent directory
+holds your credentials (`auth.json`, MCP tokens) and sessions. To make user
+level resources available, mount them read-only (opt-in):
+
+```
+PI_MSB_MOUNT="skills extensions prompts" pi-msb
+```
+
+Only `skills`, `extensions`, `prompts` (prompt templates) and `themes` can be
+named, taken from `~/.pi/agent` (or `PI_CODING_AGENT_DIR`). Edit them on the
+host and run `/reload` in pi. Extensions run inside the sandbox with the
+agent's privileges, so ones that rely on host-only tools or paths will not
+work there. The mount rules and caveats (read-only enforcement, symlinks,
+recreating the sandbox) are the same as for Claude, see "Editing skills on the
+host" below.
+
 ## Claude credentials
 
 `claude-msb` authenticates with your Claude subscription, using a long-lived
@@ -186,7 +204,38 @@ them), telemetry and error reporting are disabled, and on each launch your
 list). From `settings.json`, entries that run host commands (`hooks`,
 `statusLine`, `apiKeyHelper`, ...) are dropped, and the file is not copied at
 all if `jq` is missing on the host. Credentials, history and plugins are
-never copied.
+never copied. The copy is redone on every launch, so host edits apply from the
+next launch, files you delete on the host stay in the sandbox, and files that
+exist on the host overwrite the sandbox's copy.
+
+### Editing skills on the host: read-only mounts
+
+To see host edits immediately, mount those directories read-only instead of
+copying them (opt-in):
+
+```
+CLAUDE_MSB_MOUNT="skills agents commands" claude-msb
+```
+
+Only `skills`, `agents`, `commands` and `output-styles` can be named; they are
+mounted from `~/.claude` and are no longer copied. Pi has the same option, see
+"Pi skills, extensions and prompts" above.
+
+- **Read-only is enforced by `msb` on the host**, so even root in the sandbox
+  cannot change your files, and the agent cannot plant a skill that later runs
+  or steers a session on your host. The agent can read what is in those
+  directories (as it can with the copy), so keep secrets out of them.
+- **Symlinks that leave the directory do not work.** `msb` blocks symlinks that
+  point outside a mounted directory, so a skill that is a symlink to a shared
+  skills repo is dangling in the sandbox. The launcher warns about these;
+  keep that entry on the copy (the copy follows symlinks) or mount the real
+  location.
+- **Mounts are fixed when the sandbox is created.** Changing
+  `CLAUDE_MSB_MOUNT` (or `PI_MSB_MOUNT`) for an existing sandbox is refused
+  with a `msb rm <sandbox>` hint, in either direction. A real `~/.claude/skills`
+  directory already inside the sandbox is left alone, with a warning.
+- A running session may only pick up edits when it rescans, so start a new
+  session after changing skills.
 
 ## Behind a TLS-intercepting network
 

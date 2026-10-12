@@ -28,6 +28,11 @@
 #   CLAUDE_MSB_SKIP_PERMISSIONS=0   don't pass --dangerously-skip-permissions
 #   CLAUDE_MSB_SYNC             space separated ~/.claude entries to copy
 #                               into the sandbox on each launch
+#   CLAUDE_MSB_MOUNT            space separated ~/.claude directories
+#                               (skills agents commands output-styles) to
+#                               mount read-only instead of copying, so
+#                               host edits show up immediately; needs a
+#                               new sandbox (see README)
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/msb-agent-lib.sh"
 
@@ -40,6 +45,10 @@ claude-msb() {
     # read it when creating/modifying the sandbox.
     local CLAUDE_CODE_OAUTH_TOKEN=""
     local AWS_BEARER_TOKEN_BEDROCK=""
+
+    # Entries of ~/.claude mounted read-only (see claude_msb_mounts); the
+    # config sync skips them.
+    local claude_mounted=""
 
     # Separate from pi-msb's sandbox (named after the project alone):
     # msb re-resolves every secret on modify, so a shared sandbox needs
@@ -186,6 +195,32 @@ claude_msb_mcp_config() {
 }
 
 # ----------------------------------------------------------------
+# Read-only mounts of ~/.claude directories (CLAUDE_MSB_MOUNT). Only
+# these four leaf directories can be named: ~/.claude itself holds
+# credentials, history and projects.
+# ----------------------------------------------------------------
+claude_msb_mounts() {
+
+    local entry
+
+    claude_mounted=""
+
+    for entry in ${CLAUDE_MSB_MOUNT:-}; do
+        case "$entry" in
+            skills|agents|commands|output-styles) ;;
+            *)
+                echo "error: CLAUDE_MSB_MOUNT: '$entry' is not one of: skills agents commands output-styles" >&2
+                return 1
+                ;;
+        esac
+
+        if msb_agent_add_ro_mount "$HOME/.claude/$entry" ".claude/$entry" "claude-$entry"; then
+            claude_mounted+=" $entry"
+        fi
+    done
+}
+
+# ----------------------------------------------------------------
 # Build the Claude command line.
 # ----------------------------------------------------------------
 claude_msb_args() {
@@ -247,6 +282,11 @@ _claude_msb_sync_config() {
 
     for item in ${CLAUDE_MSB_SYNC:-CLAUDE.md settings.json skills agents commands output-styles}; do
         [[ -e "$host_claude/$item" ]] || continue
+
+        # Mounted read-only instead; copying into it would fail.
+        case " $claude_mounted " in
+            *" $item "*) continue ;;
+        esac
 
         if [[ "$item" == settings.json ]]; then
             # Drop settings that run host commands or override auth; their

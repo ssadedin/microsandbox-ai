@@ -154,6 +154,28 @@ pi_msb_install() {
 # ----------------------------------------------------------------
 # Build the Pi command line.
 # ----------------------------------------------------------------
+# Read-only mounts of Pi's user-level resource directories
+# (PI_MSB_MOUNT). Only these leaf directories can be named: the agent
+# directory itself holds auth.json and MCP tokens, and sessions.
+pi_msb_mounts() {
+
+    local base="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}" entry
+
+    for entry in ${PI_MSB_MOUNT:-}; do
+        case "$entry" in
+            skills|extensions|prompts|themes) ;;
+            *)
+                echo "error: PI_MSB_MOUNT: '$entry' is not one of: skills extensions prompts themes" >&2
+                return 1
+                ;;
+        esac
+
+        msb_agent_add_ro_mount "$base/$entry" ".pi/agent/$entry" "pi-$entry"
+    done
+
+    return 0
+}
+
 # Where Pi keeps user-level MCP servers (for --gitlab-issue). The
 # user-level file avoids Pi's project trust prompt, and "direct" puts
 # the few tools in front of the model instead of behind codemode search.

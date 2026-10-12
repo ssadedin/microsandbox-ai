@@ -27,6 +27,11 @@
 #       the guest home) and mcp_extra (JSON merged into each server
 #       entry, "{}" if none).
 #
+#   AGENT_msb_mounts       (optional)
+#       Request read-only mounts of host config directories (skills,
+#       extensions, ...) with msb_agent_add_ro_mount. Returns 1 on a
+#       bad request.
+#
 # Hooks communicate with the core via these (dynamically scoped)
 # variables of msb_agent_run: secret_args, secret_specs,
 # agent_env_args, agent_cmd, agent_args, extra_system_prompt,
@@ -465,6 +470,87 @@ _msb_agent_prepare_env() {
 }
 
 # ----------------------------------------------------------------
+# Warn about symlinks under DIR that point outside it or are broken:
+# msb blocks symlinks that leave a mounted directory, so they would not
+# work in the sandbox.
+# ----------------------------------------------------------------
+_msb_agent_warn_escaping_symlinks() {
+    local real="$1" shown="$2" link target n=0
+    local -a bad=()
+
+    command -v perl >/dev/null 2>&1 || return 0
+
+    while IFS= read -r -d '' link; do
+        target="$(perl -MCwd=abs_path -e 'print abs_path($ARGV[0])' "$link" 2>/dev/null)"
+        case "$target" in
+            "$real"/*) ;;
+            *) bad+=( "${link#"$real"/}" ) ;;
+        esac
+        (( ++n >= 500 )) && break
+    done < <(find "$real" -type l -print0 2>/dev/null)
+
+    if (( ${#bad[@]} > 0 )); then
+        {
+            echo "warning: ${#bad[@]} symlink(s) under $shown point outside it or are broken,"
+            echo "         so they will not work in the sandbox (msb blocks them):"
+            printf '           %s\n' "${bad[@]:0:5}"
+            (( ${#bad[@]} > 5 )) && echo "           ..."
+        } >&2
+    fi
+}
+
+# ----------------------------------------------------------------
+# Request a read-only mount of the host directory SRC, appearing in the
+# guest as ~/REL (a link to the mount at /opt/msb-mounts/NAME, since the
+# guest home is not known until after the sandbox exists). msb enforces
+# read-only on the host side, so even root in the guest cannot write
+# through it. Returns 1 (with a warning) if SRC is not a directory.
+#
+# Usage: msb_agent_add_ro_mount SRC REL NAME
+# ----------------------------------------------------------------
+msb_agent_add_ro_mount() {
+    local src="$1" rel="$2" name="$3" real
+
+    if [[ ! -d "$src" ]]; then
+        echo "warning: $src is not a directory; not mounting it" >&2
+        return 1
+    fi
+
+    real="$(cd "$src" && pwd -P)" || return 1
+    _msb_agent_warn_escaping_symlinks "$real" "$src"
+    agent_mounts+=( "$real|$rel|$name" )
+}
+
+# ----------------------------------------------------------------
+# Link each requested mount into the guest user's home. Run after the
+# guest user exists (uses guest_user, guest_home and name).
+# ----------------------------------------------------------------
+_msb_agent_link_mounts() {
+    local spec rest rel mount_name
+
+    for spec in ${agent_mounts[@]+"${agent_mounts[@]}"}; do
+        rest="${spec#*|}"
+        rel="${rest%%|*}"
+        mount_name="${rest#*|}"
+
+        msb exec -q --user "$guest_user" --env "HOME=$guest_home" "$name" -- \
+            bash -c '
+                link="$HOME/$1"
+                mkdir -p "$(dirname "$link")"
+
+                if [ -L "$link" ] || [ ! -e "$link" ]; then
+                    ln -sfn "$2" "$link"
+                else
+                    echo "warning: ~/$1 exists in the sandbox and is not a link;" >&2
+                    echo "         remove it to use the read-only mount" >&2
+                fi
+            ' \
+            msb-agent-link "$rel" "/opt/msb-mounts/$mount_name" \
+        || return 1
+    done
+}
+
+# ----------------------------------------------------------------
 # Print the deepest directory that contains both absolute paths.
 # ----------------------------------------------------------------
 _msb_agent_common_dir() {
@@ -494,6 +580,11 @@ msb_agent_run() {
     # submodule, whose git data lives in the superproject) where its git
     # directory is mounted; see "Submodule layout" below.
     local guest_dir="/workspace" guest_gitdir=""
+    # Read-only host directories to mount (see msb_agent_add_ro_mount) and
+    # a label describing them; mounts can only be set when a sandbox is
+    # created.
+    local -a agent_mounts=()
+    local mounts_label=none
     local git_dir="" git_common="" primary="" source_name=""
     local linked_worktree=0
     local host_uid host_gid
@@ -844,6 +935,33 @@ msb_agent_run() {
     fi
 
     # ------------------------------------------------------------
+    # Read-only host config directories (skills etc.) the agent asked
+    # for. They are mounted under /opt/msb-mounts and linked into the
+    # guest home later. A label records them: mounts can only be set
+    # when a sandbox is created.
+    # ------------------------------------------------------------
+
+    local -a ro_mount_args=() ro_restore_args=()
+
+    if declare -F "${agent}_msb_mounts" >/dev/null; then
+        "${agent}_msb_mounts" || return 1
+    fi
+
+    if (( ${#agent_mounts[@]} > 0 )); then
+        local mspec mrest mname
+        local ro_opts="ro,uid=$host_uid,gid=$host_gid,host-perms=private"
+
+        mounts_label="$(printf '%s\n' "${agent_mounts[@]}" | sort | cksum | cut -d' ' -f1)"
+
+        for mspec in "${agent_mounts[@]}"; do
+            mrest="${mspec#*|}"
+            mname="${mrest#*|}"
+            ro_mount_args+=( --mount-dir "${mspec%%|*}:/opt/msb-mounts/$mname:$ro_opts" )
+            ro_restore_args+=( -v "${mspec%%|*}:/opt/msb-mounts/$mname:$ro_opts" )
+        done
+    fi
+
+    # ------------------------------------------------------------
     # .env handling. Decided when a sandbox is created (mounts can't
     # change later) and recorded in the msb-agent-env label:
     #
@@ -877,7 +995,7 @@ msb_agent_run() {
 
         echo "Using existing sandbox: $name"
 
-        local have_label have_layout
+        local have_label have_layout have_mounts
         have_label="$(_msb_agent_label "$name" msb-agent-net open)"
 
         # Mounts can't change later, so a sandbox created for a different
@@ -889,6 +1007,18 @@ msb_agent_run() {
                 echo "error: sandbox $name was created with the checkout at $have_layout,"
                 echo "       but this launch needs it at $guest_dir. msb can't change mounts"
                 echo "       in place; remove the sandbox (installed packages are lost):"
+                echo "           msb rm $name"
+            } >&2
+            return 1
+        fi
+
+        have_mounts="$(_msb_agent_label "$name" msb-agent-mounts none)"
+        if [[ -n "$have_mounts" && "$have_mounts" != "$mounts_label" ]]; then
+            {
+                echo "error: sandbox $name was created with different read-only mounts"
+                echo "       of host config directories than this launch asks for. msb can't"
+                echo "       change mounts in place; remove the sandbox (installed packages"
+                echo "       are lost) or change the mount setting back:"
                 echo "           msb rm $name"
             } >&2
             return 1
@@ -960,6 +1090,7 @@ msb_agent_run() {
             -v "$git_common:$git_common:uid=$host_uid,gid=$host_gid,host-perms=private" \
             ${env_mount_spec:+-v "$env_mount_spec"} \
             "${restore_mounts[@]}" \
+            ${ro_restore_args[@]+"${ro_restore_args[@]}"} \
             "${net_restore_args[@]}"
         then
             rm -rf "$tmpdir"
@@ -972,6 +1103,7 @@ msb_agent_run() {
             --label "msb-agent-net=$net_label" \
             --label "msb-agent-env=$env_mode" \
             --label "msb-agent-layout=$guest_dir" \
+            --label "msb-agent-mounts=$mounts_label" \
             >/dev/null \
         || echo "warning: could not label sandbox $name" >&2
 
@@ -990,6 +1122,8 @@ msb_agent_run() {
                 "$git_dir:$guest_gitdir:uid=$host_uid,gid=$host_gid,host-perms=private"
             )
         fi
+
+        create_mounts+=( ${ro_mount_args[@]+"${ro_mount_args[@]}"} )
 
         if (( linked_worktree )); then
             echo "Git common dir: $git_common"
@@ -1023,6 +1157,7 @@ msb_agent_run() {
             --label "msb-agent-net=$net_label" \
             --label "msb-agent-env=$env_mode" \
             --label "msb-agent-layout=$guest_dir" \
+            --label "msb-agent-mounts=$mounts_label" \
             --trust-host-cas \
             "${secret_args[@]}" \
             "${create_mounts[@]}" \
@@ -1325,6 +1460,8 @@ msb_agent_run() {
     # ------------------------------------------------------------
     # Install the agent (agent specific).
     # ------------------------------------------------------------
+
+    _msb_agent_link_mounts || return 1
 
     "${agent}_msb_install" || return 1
 
