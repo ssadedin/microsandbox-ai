@@ -44,6 +44,10 @@ from gitlab_common import (
     slugify, valid_branch, valid_repo_path, PROJECT_RE,
 )
 
+class UserAbort(BridgeError):
+    """The user chose to abort at a prompt."""
+
+
 STATE_VERSION = 2
 MAX_REPOS = 200
 MAX_DEPTH = 6
@@ -237,6 +241,22 @@ def discover(root_workdir, root_gitdir, root_common, root_url, inst, root_projec
 
 def in_working_set(project, patterns):
     return any(fnmatch.fnmatchcase(project, p) for p in patterns)
+
+
+def quiet_skip(r, patterns):
+    """A reason to skip the repo without asking GitLab anything, or None.
+
+    That is a clean repo detached on the commit its parent records whose
+    project is not in the working set (see classify): it needs nothing, so
+    a project GitLab can't find must not matter for it.
+    """
+    if audit_config(r["gitdir"], r["common"]):
+        return None
+    kind, val = read_head(r["gitdir"])
+    if (kind == "detached" and r["recorded"] and val == r["recorded"]
+            and not in_working_set(r["project"], patterns) and not is_dirty(r)):
+        return "detached on the commit the parent records, not in the working set"
+    return None
 
 
 def classify(r, branch, default, patterns):
@@ -527,38 +547,58 @@ def prepare(args):
         for r in repos:
             if r["status"] == "skipped":
                 continue
-            default = gl.default_branch(r["project"])
-            r["default_branch"] = default
-            action, reasons, can_checkout = classify(r, branch, default, patterns)
-
-            while True:
-                if action == "ask":
-                    if r["project"] in skipped_before:
-                        action, reasons = "skip", ["skipped (remembered)"]
-                        continue
-                    choice = ask_user(r, default, reasons, can_checkout, args.skip_unprepared)
-                    if choice == "abort":
-                        raise BridgeError("aborted")
-                    if choice == "skip-always":
-                        remember_skip(args.primary or args.repo, r["project"])
-                    action = "checkout" if choice == "checkout" else "skip"
-                    if action == "skip":
-                        reasons = ["skipped by you"]
-                        continue
-                if action == "skip":
-                    r["status"], r["reason"] = "skipped", "; ".join(reasons)
-                    break
-                try:
-                    r["how"] = apply_action(inst, r, action, branch, default)
-                    r["status"] = "ready"
-                except BridgeError as e:
-                    if action != "checkout":
-                        raise
-                    restore_orig(r)
-                    say(f"{r['path']}: {e}")
-                    action, reasons, can_checkout = "ask", [str(e)], False
+            try:
+                reason = quiet_skip(r, patterns)
+                if reason:
+                    r["status"], r["reason"] = "skipped", reason
+                    save_state(args.state, state)
                     continue
-                break
+
+                default = gl.default_branch(r["project"])
+                r["default_branch"] = default
+                action, reasons, can_checkout = classify(r, branch, default, patterns)
+
+                while True:
+                    if action == "ask":
+                        if r["project"] in skipped_before:
+                            action, reasons = "skip", ["skipped (remembered)"]
+                            continue
+                        choice = ask_user(r, default, reasons, can_checkout, args.skip_unprepared)
+                        if choice == "abort":
+                            raise UserAbort("aborted")
+                        if choice == "skip-always":
+                            remember_skip(args.primary or args.repo, r["project"])
+                        action = "checkout" if choice == "checkout" else "skip"
+                        if action == "skip":
+                            reasons = ["skipped by you"]
+                            continue
+                    if action == "skip":
+                        r["status"], r["reason"] = "skipped", "; ".join(reasons)
+                        break
+                    try:
+                        r["how"] = apply_action(inst, r, action, branch, default)
+                        r["status"] = "ready"
+                    except BridgeError as e:
+                        if action != "checkout":
+                            raise
+                        restore_orig(r)
+                        say(f"{r['path']}: {e}")
+                        action, reasons, can_checkout = "ask", [str(e)], False
+                        continue
+                    break
+            except UserAbort:
+                raise
+            except BridgeError as e:
+                # A problem with one submodule (a project GitLab can't find,
+                # a broken git dir, ...) must not block the session: warn,
+                # put the repo back as it was and skip it. The root repo is
+                # needed, so its errors stay fatal.
+                if r["path"] == ".":
+                    raise
+                if r.get("orig") and not r.get("created_sha"):
+                    restore_orig(r)
+                r["status"], r["reason"] = "skipped", f"cannot prepare: {e}"
+                say(f"warning: {r['path']} ({r['project']}): {e}; skipping it")
             save_state(args.state, state)
     except BridgeError:
         rollback(inst, repos)

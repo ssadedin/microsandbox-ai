@@ -383,6 +383,13 @@ Instance, token and project mapping live on the host in
   skipped. "Skip and don't ask again" answers are remembered in
   `~/.local/state/msb-agent/gitlab/`.
 
+A submodule that cannot be prepared never blocks the session: if its GitLab
+project cannot be found (for example a `.wiki` submodule or a stale URL), or
+anything else goes wrong with it, the launcher prints a warning, leaves the repo
+as it was and skips it. A clean submodule detached on its recorded commit that is
+outside the `working_set` is skipped without asking GitLab anything, so it does
+not need a valid project at all. Only a failure in the checkout itself is fatal.
+
 Only submodules that are initialised at launch take part. Pushes are never
 forced and never target a default or protected branch.
 
