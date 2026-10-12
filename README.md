@@ -408,7 +408,8 @@ submodule) match the one `VCGS/CBU/*` entry:
   },
   "repos": {
     "VCGS/CBU/*": {
-      "issue_project": "VCGS/CBU/clinicalbioinformatics"
+      "issue_project": "VCGS/CBU/clinicalbioinformatics",
+      "working_set" : [ "webservices", "gip", "webservices/ghm" ]
     }
   }
 }
