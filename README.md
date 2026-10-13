@@ -49,7 +49,7 @@ redoing all that work.
   - you may need to ensure you have sufficent Node version, see https://github.com/nvm-sh/nvm
 - Clone the repository of [microsandbox-ai](https://git.mcri.edu.au/bioinfomethods/microsandbox-ai) to an
   appropriate place on your computer
-- Authenticate at least once directly on own computer using the method you intend to use within the sandbox
+- Authenticate at least once directly on own computer using the method you intend to use within the sandbox, eg: run `claude` and then do `/login`.
   - Note: the launcher scripts piggyback from on your outside auth to bootstrap a token to use in the sandbox
 - You can then run the tools using the launcher scripts in the `scripts` folder:
 
