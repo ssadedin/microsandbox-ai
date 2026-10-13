@@ -17,7 +17,12 @@ inconvenient and introduces many limitations and challenges. For example:
 
 These scripts facilitate some niceties including:
 
-- setup of secrets for OpenRouter, Bedrock and Anthropic (both short-lived)
+- auto-creation of sandbox with a simple model:
+  - whatever folder you run it in becomes the only folder it can see, staged into the VM 
+    under `/workspace`
+  - smart setup to stage in Git repository config and files so 
+    the AI model can see git and commit locally but not push commits anywhere
+- setup of secrets / auth for Claude, OpenRouter, Bedrock / Anthropic (both short-lived)
   automatically with placeholders passed through to the AI models and 
   transparent substitution via TLS interception
 - restricted network with auto-whitelist of common networking requirements so that
@@ -36,6 +41,21 @@ the contained agent has full admin / sudo access and can install and run tools s
 other platform / infrastructure requirements. The sandboxes are also persistent - so once an agent does 
 do significant setup work, the sandbox can be saved and snapshotted so that it can start again without
 redoing all that work.
+
+
+## Install / setup
+
+- Install Microsandbox from https://github.com/superradcompany/microsandbox
+  - you may need to ensure you have sufficent Node version, see https://github.com/nvm-sh/nvm
+- Clone the repository of [microsandbox-ai](https://git.mcri.edu.au/bioinfomethods/microsandbox-ai) to an
+  appropriate place on your computer
+- Authenticate at least once directly on own computer using the method you intend to use within the sandbox
+  - Note: the launcher scripts piggyback from on your outside auth to bootstrap a token to use in the sandbox
+- You can then run the tools using the launcher scripts in the `scripts` folder:
+
+    ```
+    bash /path/to/install/scripts/claude-msb.sh
+    ```
 
 ## Architecture
 
