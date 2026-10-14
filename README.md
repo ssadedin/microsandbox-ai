@@ -59,61 +59,9 @@ redoing all that work.
 
 ## Architecture
 
-```plantuml
-@startuml
-skinparam shadowing false
-skinparam componentStyle rectangle
-skinparam defaultTextAlignment center
-skinparam packageStyle rectangle
-skinparam ArrowFontSize 11
-left to right direction
+![Architecture](architecture.png)
 
-actor "User" as user
-
-package "Host (trusted)" as host #F4F8FF {
-  component "claude-msb\npi-msb" as entry
-  component "Launcher" as lib
-  component "msb" as msb
-  component "GitLab bridge" as bridge
-  component "Screenshots" as shots
-  database "Config and\ncredentials" as cfg
-}
-
-package "Sandbox VM (untrusted)" as vm #FFF6F0 {
-  component "Agent" as agent
-  component "GitLab MCP" as mcp
-  component "Screenshot\ncommand" as shot
-  folder "/workspace" as ws
-}
-
-cloud "LLM providers" as llm
-cloud "GitLab" as gl
-cloud "Allowlisted\ninternet" as net
-
-user --> entry
-entry --> lib
-lib --> msb : create / exec
-lib ..> cfg : read
-lib --> bridge
-lib --> shots
-msb --> agent : runs
-
-agent --> mcp
-agent --> shot
-mcp --> ws : request files
-shot --> ws : request files
-bridge <-- ws : polls
-shots <-- ws : polls
-
-agent ..> msb : HTTPS
-msb ..> llm : real key\nsubstituted
-msb ..> net : allowlist
-bridge ..> gl : API, git
-@enduml
-```
-
-(GitLab renders the diagram above when its PlantUML integration is enabled;
-the source is plain text otherwise.)
+Source: [architecture.puml](architecture.puml).
 
 - **Trust boundary.** The sandbox is untrusted: anything the agent can write
   (the checkout, `.git`, the request files) is treated as hostile by the host
