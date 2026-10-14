@@ -1408,15 +1408,20 @@ msb_agent_run() {
 
                 export DEBIAN_FRONTEND=noninteractive
 
+                # msb only allows an IP while the DNS answer that
+                # mapped it to an allowed host is live, and the Debian
+                # CDN hands out TTLs of a few seconds. apt reuses its
+                # lookup within a run, so a connection opened after the
+                # TTL lapses is refused; a new run looks it up again.
                 # --error-on=any: fail (and retry) on fetch errors,
                 # which apt otherwise only warns about.
                 for attempt in 1 2 3; do
-                    apt-get update --error-on=any && break
+                    apt-get update --error-on=any \
+                        && apt-get install -y sudo \
+                        && break
                     (( attempt < 3 )) || exit 1
                     sleep 3
                 done
-
-                apt-get install -y sudo
             fi
 
             printf "%s ALL=(ALL) NOPASSWD:ALL\n" "$guest_user" \

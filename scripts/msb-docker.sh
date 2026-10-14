@@ -67,9 +67,16 @@ if ! command -v dockerd >/dev/null 2>&1; then
         policy_rc=1
     fi
 
-    apt-get update -q
-    apt-get install -y -q docker-ce docker-ce-cli containerd.io \
-        docker-buildx-plugin docker-compose-plugin
+    # Retry in a new apt run: apt reuses its DNS lookup within a run,
+    # and msb stops allowing the IPs once the (short) TTL lapses.
+    for attempt in 1 2 3; do
+        apt-get update -q \
+            && apt-get install -y -q docker-ce docker-ce-cli containerd.io \
+                docker-buildx-plugin docker-compose-plugin \
+            && break
+        (( attempt < 3 )) || exit 1
+        sleep 3
+    done
 
     [[ -n "$policy_rc" ]] && rm -f /usr/sbin/policy-rc.d
 fi
