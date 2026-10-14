@@ -56,6 +56,8 @@ Outbound HTTPS is intercepted by that proxy (TLS interception), so servers prese
 - Other tools with their own CA list: point them at /etc/ssl/certs/ca-certificates.crt (e.g. `pip config set global.cert`, `npm config set cafile`, `DENO_CERT`, `GIT_SSL_CAINFO`, `AWS_CA_BUNDLE`) or add /.msb/tls/ca.pem to their trust store.
 Never disable certificate verification. If you still cannot get a tool to connect, stop and report the exact error and command instead of skipping the step.
 
+Known quirk: an allowed host can briefly refuse connections ("Connection refused" mid-download, e.g. during apt-get install) because the sandbox's allowlist expires short DNS TTLs strictly. Rerun the same command once; it is not blocked HTTP, a bad mirror or a proxy problem, so don't change sources or settings for it.
+
 Docker: run `msb-docker` to install (if needed) and start it. There is no init system and the root filesystem is an overlay Docker cannot store images on, so do not install or start Docker any other way; the helper puts its storage on a loop-mounted disk image. Rerun it after a sandbox restart. Containers do not trust the proxy CA: for `docker run`, mount /etc/ssl/certs/ca-certificates.crt read-only at the same path and set SSL_CERT_FILE and CURL_CA_BUNDLE to it (images may set their own bundle path); for `docker build`, pass it with `--secret id=ca,src=/etc/ssl/certs/ca-certificates.crt` and use `RUN --mount=type=secret,id=ca` with those variables pointed at /run/secrets/ca. Do not mount it over the image's own bundle path during a build, as installing ca-certificates then fails.
 EOF_PROMPT
 )"
