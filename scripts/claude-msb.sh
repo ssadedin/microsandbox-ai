@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Run Claude Code inside a microsandbox, authenticated with the user's
 # Claude subscription. See msb-agent-lib.sh for the shared sandbox/
 # worktree/screenshot machinery.

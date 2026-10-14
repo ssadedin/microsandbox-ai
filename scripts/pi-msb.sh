@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Run the Pi coding agent inside a microsandbox. See msb-agent-lib.sh for
 # the shared sandbox/worktree/screenshot machinery.
 
