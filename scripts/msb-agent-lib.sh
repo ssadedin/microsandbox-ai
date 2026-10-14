@@ -74,8 +74,12 @@ EOF_PROMPT
 # uploads to attacker-controlled buckets. Everything below only serves
 # downloads to a sandbox without credentials.
 _MSB_AGENT_NET_ALLOW_DEFAULT=(
-    # Debian packages
+    # OS packages (Debian for the sandbox itself; Ubuntu and Alpine for
+    # common container base images). Ubuntu's mirrors are named, not
+    # "*.ubuntu.com", which also covers logins and forums.
     "*.debian.org"
+    archive.ubuntu.com security.ubuntu.com ports.ubuntu.com
+    dl-cdn.alpinelinux.org
 
     # Git hosting. The sandbox has no credentials for these, so they
     # are effectively read-only (clone, fetch, API reads, downloads).
