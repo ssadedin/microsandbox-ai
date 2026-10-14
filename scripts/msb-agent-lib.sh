@@ -55,6 +55,8 @@ Outbound HTTPS is intercepted by that proxy (TLS interception), so servers prese
 - Java (Gradle, Maven, sbt, etc.): run `msb-trust-java`, which adds the CA to every JDK it finds. It runs automatically after apt installs; run it yourself after installing a JDK any other way (SDKMAN, tarballs, Gradle toolchains), then stop any running Gradle daemons (`./gradlew --stop`) and retry.
 - Other tools with their own CA list: point them at /etc/ssl/certs/ca-certificates.crt (e.g. `pip config set global.cert`, `npm config set cafile`, `DENO_CERT`, `GIT_SSL_CAINFO`, `AWS_CA_BUNDLE`) or add /.msb/tls/ca.pem to their trust store.
 Never disable certificate verification. If you still cannot get a tool to connect, stop and report the exact error and command instead of skipping the step.
+
+Docker: run `msb-docker` to install (if needed) and start it. There is no init system and the root filesystem is an overlay Docker cannot store images on, so do not install or start Docker any other way; the helper puts its storage on a loop-mounted disk image. Rerun it after a sandbox restart. Containers do not trust the proxy CA: for `docker run`, mount /etc/ssl/certs/ca-certificates.crt read-only at the same path and set SSL_CERT_FILE and CURL_CA_BUNDLE to it (images may set their own bundle path); for `docker build`, pass it with `--secret id=ca,src=/etc/ssl/certs/ca-certificates.crt` and use `RUN --mount=type=secret,id=ca` with those variables pointed at /run/secrets/ca. Do not mount it over the image's own bundle path during a build, as installing ca-certificates then fails.
 EOF_PROMPT
 )"
 
@@ -1433,6 +1435,8 @@ msb_agent_run() {
     #                   --with-screenshots).
     #   msb-gitlab-mcp  MCP server for the host's GitLab bridge (see
     #                   --gitlab-issue).
+    #   msb-docker      Install and start Docker (no init system, and
+    #                   its storage needs a non-overlay filesystem).
     # ------------------------------------------------------------
 
     msb exec -q "$name" -- \
@@ -1442,8 +1446,9 @@ msb_agent_run() {
             printf "%s" "$1" > /usr/local/bin/msb-trust-java
             printf "%s" "$2" > /usr/local/bin/msb-screenshot
             printf "%s" "$3" > /usr/local/bin/msb-gitlab-mcp
+            printf "%s" "$4" > /usr/local/bin/msb-docker
             chmod 0755 /usr/local/bin/msb-trust-java /usr/local/bin/msb-screenshot \
-                /usr/local/bin/msb-gitlab-mcp
+                /usr/local/bin/msb-gitlab-mcp /usr/local/bin/msb-docker
 
             printf "%s\n" \
                 "DPkg::Post-Invoke { \"/usr/local/bin/msb-trust-java -q || true\"; };" \
@@ -1455,7 +1460,8 @@ msb_agent_run() {
         "$(< "$_MSB_AGENT_LIB_DIR/msb-trust-java.sh")" \
         "$(< "$_MSB_AGENT_LIB_DIR/msb-screenshot.sh")" \
         "$(< "$_MSB_AGENT_LIB_DIR/msb-gitlab-mcp.js")" \
-    || echo "warning: could not install guest helpers (Java CA trust, screenshots, GitLab)" >&2
+        "$(< "$_MSB_AGENT_LIB_DIR/msb-docker.sh")" \
+    || echo "warning: could not install guest helpers (Java CA trust, screenshots, GitLab, Docker)" >&2
 
     # ------------------------------------------------------------
     # Install the agent (agent specific).
