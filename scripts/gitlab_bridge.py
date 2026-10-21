@@ -20,8 +20,10 @@ Operations the agent can request:
 
     status                     the repos, their branches and MRs
     get_issue / comment_issue  the one ticket
-    get_attachment             an image uploaded to the ticket, by its
-                               number in get_issue's attachment list
+    get_attachment             an image uploaded to the ticket (or to one
+                               repo's MR), by its number in the
+                               attachment list of get_issue (or
+                               get_merge_request)
     get_merge_request /
     comment_merge_request      the MR of one repo's branch
     submit_merge_requests      push the branch of every repo that has
@@ -37,8 +39,9 @@ could redirect the token or widen access comes from host-side state:
   * branch:  --branch, or the root's feature branch, or <iid>-<title slug>
 
 A request may name a repo only as a path from that startup list, and
-an attachment only by number: the bridge rereads the ticket and fetches
-only uploads its text references, from the issue's own project.
+an attachment only by number: the bridge rereads the ticket (or MR) and
+fetches only uploads its text references, from the issue's (or MR's) own
+project.
 
 Config (JSON):
 
@@ -352,10 +355,10 @@ class Bridge:
         return found
 
     @staticmethod
-    def _format_attachments(found):
+    def _format_attachments(found, how="its number"):
         if not found:
             return "Attachments: none"
-        out, n = ["Attachments (fetch an image with gitlab_get_attachment and its number):"], 0
+        out, n = [f"Attachments (fetch an image with gitlab_get_attachment and {how}):"], 0
         for a in found:
             name = one_line(a["name"], 100)
             if a["why"] is None:
@@ -387,13 +390,21 @@ class Bridge:
         index = req.get("index")
         if not isinstance(index, int) or isinstance(index, bool) or index < 1:
             raise BridgeError("'index' must be an attachment number from gitlab_get_issue")
-        project = self.s.issue["project"]
-        issue, notes = self._read_issue()
-        images = [a for a in self._attachments(project, issue.get("description"), notes)
-                  if a["why"] is None]
+        if req.get("merge_request") is True:
+            r = self._repo(req)
+            mr = self._open_mr(r)
+            if mr is None:
+                raise BridgeError(f"no open merge request for {self.branch} in {r['project']}")
+            project, description, notes = r["project"], mr.get("description"), self._mr_notes(r, mr)
+            source = f"the merge request {r['project']}!{mr['iid']}"
+            stem = f"mr-{r['project'].replace('/', '-')}-{mr['iid']}"
+        else:
+            issue, notes = self._read_issue()
+            project, description = self.s.issue["project"], issue.get("description")
+            source, stem = "the ticket", f"issue-{self.s.issue['iid']}"
+        images = [a for a in self._attachments(project, description, notes) if a["why"] is None]
         if index > len(images):
-            raise BridgeError(f"the ticket has {len(images)} image attachment(s) "
-                              "(see gitlab_get_issue)")
+            raise BridgeError(f"{source} has {len(images)} image attachment(s)")
         a = images[index - 1]
         data, _ = self.gl.download(
             f"{self.gl.project_path(project)}/uploads/{a['secret']}/"
@@ -402,7 +413,7 @@ class Bridge:
         if kind is None:
             raise BridgeError(f"{a['name']} is not a PNG, JPEG, GIF or WebP image")
         ext, mime = kind
-        name = f"issue-{self.s.issue['iid']}-{index}.{ext}"
+        name = f"{stem}-{index}.{ext}"
         save_file(self.dir_fd, ATTACHMENT_DIR, name, data)
         return {
             "text": (f"Attachment [{index}] {one_line(a['name'], 100)} from {a['where']} "
@@ -418,9 +429,8 @@ class Bridge:
             return (f"No open merge request for {self.branch} in {r['project']}. "
                     "Use gitlab_submit_merge_requests when the work is ready.")
         who = user_name(mr.get("author"))
-        notes = self.gl.call(
-            "GET", f"{self.gl.project_path(r['project'])}/merge_requests/{mr['iid']}/notes",
-            {"per_page": 100, "sort": "asc", "order_by": "created_at"})
+        notes = self._mr_notes(r, mr)
+        found = self._attachments(r["project"], mr.get("description"), notes)
         return "\n".join([
             f"Merge request {r['project']}!{mr['iid']}: {mr.get('title', '')}",
             f"URL: {mr.get('web_url', '')}",
@@ -428,8 +438,16 @@ class Bridge:
             f"{mr.get('source_branch')} -> {mr.get('target_branch')}  "
             f"Merge status: {mr.get('detailed_merge_status', mr.get('merge_status', ''))}",
             "", "Description:", fence(f"@{who}", mr.get("description"), MAX_DESCRIPTION_SHOWN),
-            "", format_notes(notes or []),
+            "", format_notes(notes),
+            "", self._format_attachments(
+                found, f"its number, merge_request true and repo {r['path']!r}"),
         ])
+
+    def _mr_notes(self, r, mr):
+        notes = self.gl.call(
+            "GET", f"{self.gl.project_path(r['project'])}/merge_requests/{mr['iid']}/notes",
+            {"per_page": 100, "sort": "asc", "order_by": "created_at"})
+        return [n for n in notes or [] if not n.get("system")]
 
     # -- commenting ------------------------------------------------
 

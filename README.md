@@ -271,9 +271,10 @@ host process does the work, so the sandbox holds no GitLab credentials.
 Images uploaded to the issue (screenshots in its description or comments)
 are listed by `gitlab_get_issue` and fetched by number with
 `gitlab_get_attachment`, which returns the image and saves a copy under
-`.<tool>/gitlab-requests/attachments/`. On each request the bridge rereads the
-issue and fetches only an upload its text references, from the issue's own
-project, through the uploads API (GitLab 17.4 or later). Links to other
+`.<tool>/gitlab-requests/attachments/`; `gitlab_get_merge_request` lists and
+fetches a merge request's images the same way. On each request the bridge
+rereads the issue (or merge request) and fetches only an upload its text
+references, from its own project, through the uploads API (GitLab 17.4 or later). Links to other
 projects' uploads or to other sites are listed but never fetched, and only
 PNG, JPEG, GIF and WebP files up to 5 MB are returned.
 
