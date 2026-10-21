@@ -633,7 +633,9 @@ def briefing(state):
         f"or \"the ticket\", or gives its number, they mean this one; you cannot access any other. "
         f"The msb-gitlab MCP tools are bound to this ticket and to the branch name {branch}; a host "
         f"process does the work, so you need no GitLab credentials and must not try to push or call "
-        f"the API yourself. Read the ticket first with gitlab_get_issue when asked to work on it.",
+        f"the API yourself. Read the ticket first with gitlab_get_issue when asked to work on it; "
+        f"images posted in it (such as screenshots) are listed under Attachments, and "
+        f"gitlab_get_attachment fetches one by its number.",
         "",
         f"The work may span several git repositories (the checkout and its submodules). Each of these "
         f"is already on the branch {branch}, created for this ticket; commit your changes in the repository "

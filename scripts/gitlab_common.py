@@ -298,6 +298,22 @@ class GitLab:
         except (urllib.error.URLError, OSError, ValueError) as e:
             raise BridgeError(f"cannot reach GitLab: {getattr(e, 'reason', e)}")
 
+    def download(self, path, limit):
+        """GET raw bytes (at most limit). Returns (data, content_type)."""
+        req = urllib.request.Request(f"{self.inst.base}/api/v4{path}", method="GET", headers={
+            "PRIVATE-TOKEN": self.inst.token, "User-Agent": "msb-agent-gitlab-bridge"})
+        try:
+            with self.opener.open(req, timeout=60) as resp:
+                data = resp.read(limit + 1)
+                ctype = resp.headers.get("Content-Type", "")
+        except urllib.error.HTTPError as e:
+            raise BridgeError(f"GitLab GET {path.split('?')[0]} failed: HTTP {e.code}")
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise BridgeError(f"cannot reach GitLab: {getattr(e, 'reason', e)}")
+        if len(data) > limit:
+            raise BridgeError(f"file is larger than {limit // (1024 * 1024)} MB")
+        return data, ctype
+
     @staticmethod
     def project_path(project):
         return "/projects/" + urllib.parse.quote(project, safe="")

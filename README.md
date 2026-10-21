@@ -268,6 +268,15 @@ project or branch argument, so the agent can only act on the issue you named
 and one branch name; a repo is chosen only from the list built at startup. A
 host process does the work, so the sandbox holds no GitLab credentials.
 
+Images uploaded to the issue (screenshots in its description or comments)
+are listed by `gitlab_get_issue` and fetched by number with
+`gitlab_get_attachment`, which returns the image and saves a copy under
+`.<tool>/gitlab-requests/attachments/`. On each request the bridge rereads the
+issue and fetches only an upload its text references, from the issue's own
+project, through the uploads API (GitLab 17.4 or later). Links to other
+projects' uploads or to other sites are listed but never fetched, and only
+PNG, JPEG, GIF and WebP files up to 5 MB are returned.
+
 ### Submodules
 
 The work can span the checkout and its (nested) submodules, all on the same
