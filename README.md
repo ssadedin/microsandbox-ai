@@ -253,6 +253,31 @@ linked worktree uses its main checkout's section. `MSB_AGENT_MOUNTS`
   `--gitlab-issue` only covers the project and its submodules, not mounted
   repositories.
 
+## Setup scripts
+
+A sandbox starts from a stock image, and anything installed in it is lost
+when it is recreated. To redo that setup automatically, commit a bash script
+as `.msb-agent/setup.sh` in the project, and optionally keep a personal one
+for every project in `~/.config/msb-agent/setup.sh` on the host:
+
+```bash
+set -euo pipefail
+sudo apt-get update && sudo apt-get install -y openjdk-17-jdk-headless
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+- Both run before the agent starts, the personal one first, as the agent's
+  user (with passwordless sudo, so use `sudo` for system packages) in the
+  project directory, with a login shell.
+- Each runs once per sandbox and again whenever its content changes, so make
+  it safe to rerun. Worktree sandboxes cloned from the main one don't rerun
+  an unchanged script.
+- A failing script stops the launch and is retried on the next one.
+- The scripts only run inside the VM, with the same access as the agent, so
+  the project's script needs no approval even though the agent could change
+  it in a commit. The agent is asked to suggest additions to it when it
+  installs something a new sandbox would also need.
+
 ## Behind a TLS-intercepting network
 
 If your network re-signs HTTPS with a company root (Zscaler and similar),

@@ -49,7 +49,7 @@ _MSB_AGENT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 _MSB_AGENT_ENV_PROMPT="$(cat <<'EOF_PROMPT'
 You are running inside a microsandbox VM (Debian, passwordless sudo). The project is mounted at /workspace. API credentials are placeholders that are replaced with real values by a proxy on the host; they are not usable secrets.
 
-You have full administrator rights here: sudo needs no password, and the VM is disposable, so nothing you install can affect the user's machine. If building, running or testing needs a tool, runtime, database or library that is missing, install it instead of working around it (do not mock or stub it out, skip tests, or rewrite code to avoid a dependency). Use `sudo apt-get update && sudo apt-get install -y <package>` for system packages and toolchains (the Debian mirrors are reachable), and the normal package managers for language dependencies (npm, pnpm, yarn, pip, uv, cargo, go, Maven, Gradle, gem, composer, NuGet and similar), whose upstream registries are reachable too. JDK and toolchain managers (SDKMAN, Adoptium, rustup) and Playwright browser downloads work as well. Installs persist in this sandbox across sessions of this project, so mention anything the project's own setup docs or scripts should also install. If something you need is blocked, see the note on network access.
+You have full administrator rights here: sudo needs no password, and the VM is disposable, so nothing you install can affect the user's machine. If building, running or testing needs a tool, runtime, database or library that is missing, install it instead of working around it (do not mock or stub it out, skip tests, or rewrite code to avoid a dependency). Use `sudo apt-get update && sudo apt-get install -y <package>` for system packages and toolchains (the Debian mirrors are reachable), and the normal package managers for language dependencies (npm, pnpm, yarn, pip, uv, cargo, go, Maven, Gradle, gem, composer, NuGet and similar), whose upstream registries are reachable too. JDK and toolchain managers (SDKMAN, Adoptium, rustup) and Playwright browser downloads work as well. Installs persist in this sandbox across sessions of this project, but a new sandbox starts without them: when you install something a fresh sandbox would also need, suggest adding it to .msb-agent/setup.sh in the project (a bash script run as your user, with sudo, in every new sandbox and again whenever it changes; it should be safe to rerun). It may be read-only here; if so, give the user the lines to add. Also mention anything the project's own setup docs should cover. If something you need is blocked, see the note on network access.
 
 Outbound HTTPS is intercepted by that proxy (TLS interception), so servers present certificates signed by the microsandbox CA at /.msb/tls/ca.pem. It is already in the system bundle /etc/ssl/certs/ca-certificates.crt, and SSL_CERT_FILE, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE and NODE_EXTRA_CA_CERTS point at it, so curl, git, Python, Node and Go work as usual. If a tool fails with a certificate error (PKIX path building failed, unable to get local issuer certificate, self-signed certificate in chain), make that tool trust the CA rather than giving up:
 - Java (Gradle, Maven, sbt, etc.): run `msb-trust-java`, which adds the CA to every JDK it finds. It runs automatically after apt installs; run it yourself after installing a JDK any other way (SDKMAN, tarballs, Gradle toolchains), then stop any running Gradle daemons (`./gradlew --stop`) and retry.
@@ -824,6 +824,56 @@ _msb_agent_extra_mounts() {
     if (( ${#extra_mounts[@]} > 0 )); then
         extra_label="$(printf '%s\n' "${extra_mounts[@]%|*}" | sort | cksum | cut -d' ' -f1)"
     fi
+}
+
+# ----------------------------------------------------------------
+# Run the user's setup scripts in the sandbox: the personal one on the
+# host, then the project's (committed, so a fresh clone gets it too):
+#
+#   ~/.config/msb-agent/setup.sh      every project
+#   <checkout>/.msb-agent/setup.sh    this project
+#
+# Each runs as the guest user (with passwordless sudo) in the checkout,
+# once per sandbox and again when its content changes; a hash of what
+# last succeeded is kept in the guest, so worktree sandboxes cloned
+# from the main one don't rerun it. They only ever run inside the VM,
+# with no more access than the agent has, so they need no approval.
+# A failure stops the launch, and the next launch retries.
+# ----------------------------------------------------------------
+_msb_agent_run_setup() {
+    local kind file hash
+
+    for kind in personal project; do
+        if [[ "$kind" == personal ]]; then
+            file="$_MSB_AGENT_CONFIG_DIR/setup.sh"
+        else
+            file="$dir/.msb-agent/setup.sh"
+        fi
+        [[ -f "$file" ]] || continue
+
+        hash="$(_msb_agent_sha256 < "$file")"
+
+        msb exec -q --user "$guest_user" \
+            --env "HOME=$guest_home" --env "USER=$guest_user" \
+            --workdir "$guest_dir" "$name" -- \
+            bash -c '
+                state=/var/lib/msb-agent/setup
+                [ "$(cat "$state/$1.sha256" 2>/dev/null)" = "$2" ] && exit 0
+
+                echo "Running $4 setup script ($3)..."
+                sudo mkdir -p "$state" || exit 1
+                printf "%s" "$5" | sudo tee "$state/$1.sh" >/dev/null || exit 1
+
+                bash -l "$state/$1.sh" || exit $?
+
+                printf "%s\n" "$2" | sudo tee "$state/$1.sha256" >/dev/null
+            ' \
+            msb-agent-setup "$kind" "$hash" "$file" "$kind" "$(< "$file")" \
+        || {
+            echo "error: $file failed in sandbox $name; fix it and relaunch to retry" >&2
+            return 1
+        }
+    done
 }
 
 # ----------------------------------------------------------------
@@ -1798,6 +1848,8 @@ msb_agent_run() {
         echo "       the sandbox mounts may have been created by an older $tool version" >&2
         return 1
     fi
+
+    _msb_agent_run_setup || return 1
 
     # ------------------------------------------------------------
     # Screenshots: a host helper watches /workspace/.<tool>/ (via the
