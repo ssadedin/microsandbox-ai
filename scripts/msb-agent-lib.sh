@@ -559,6 +559,274 @@ _msb_agent_link_mounts() {
 }
 
 # ----------------------------------------------------------------
+# Extra host directories mounted into the sandbox: data to read, or
+# other repositories to work on. Each entry is SRC[:TARGET][:ro|rw]:
+# TARGET defaults to /workspace/<basename of SRC> and the mode to ro.
+# A relative SRC is relative to the project's main checkout.
+#
+# Entries come from MSB_AGENT_MOUNTS (whitespace separated) and from the
+# project's section of the host-only file below, which the sandbox can
+# neither see nor change:
+#
+#   [/path/to/main/checkout]
+#   ~/data/reference
+#   ../shared-lib:rw
+#   ../other:/workspace/vendor/other:rw
+# ----------------------------------------------------------------
+
+_MSB_AGENT_MOUNTS_FILE="$_MSB_AGENT_CONFIG_DIR/mounts"
+
+# Print PATH with a leading ~ expanded and, if relative, made absolute
+# against BASE.
+_msb_agent_expand_path() {
+    local path="$1" base="$2"
+
+    case "$path" in
+        "~") path="$HOME" ;;
+        "~/"*) path="$HOME/${path#"~/"}" ;;
+    esac
+    [[ "$path" == /* ]] || path="$base/$path"
+
+    printf '%s' "$path"
+}
+
+# True if absolute path A is B or lies below it.
+_msb_agent_path_within() {
+    [[ "$1" == "$2" || "$1" == "${2%/}"/* ]]
+}
+
+# Print the entries in FILE's section for project KEY, one per line.
+# Lines are trimmed; empty lines and lines starting with # are skipped.
+_msb_agent_mount_file_entries() {
+    local file="$1" key="$2" line header in_section=0
+
+    [[ -r "$file" ]] || return 0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == "#"* ]] && continue
+
+        if [[ "$line" == "["*"]" ]]; then
+            header="$(_msb_agent_expand_path "${line:1:${#line}-2}" "$HOME")"
+            [[ -d "$header" ]] && header="$(cd "$header" && pwd -P)"
+            in_section=0
+            [[ "${header%/}" == "$key" ]] && in_section=1
+        elif (( in_section )); then
+            printf '%s\n' "$line"
+        fi
+    done < "$file"
+}
+
+# Parse one entry (from ORIGIN, for messages) and append
+# "SRC|TARGET|MODE|DEFAULTED" to extra_mounts. Returns 1 on a bad entry.
+# Usage: _msb_agent_add_extra_mount ENTRY BASE ORIGIN
+_msb_agent_add_extra_mount() {
+    local entry="$1" base="$2" origin="$3"
+    local src target="" mode="" field real protected
+    local -a fields
+
+    IFS=: read -r -a fields <<< "$entry"
+    src="${fields[0]:-}"
+
+    if [[ -z "$src" ]] || (( ${#fields[@]} > 3 )); then
+        echo "error: $origin: '$entry' is not SRC[:TARGET][:ro|rw]" >&2
+        return 1
+    fi
+
+    for field in "${fields[@]:1}"; do
+        if [[ "$field" == /* && -z "$target" ]]; then
+            target="$field"
+        elif [[ ( "$field" == ro || "$field" == rw ) && -z "$mode" ]]; then
+            mode="$field"
+        elif [[ -n "$field" ]]; then
+            echo "error: $origin: '$entry': '$field' is not an absolute target or ro/rw" >&2
+            return 1
+        fi
+    done
+
+    src="$(_msb_agent_expand_path "$src" "$base")"
+    if [[ ! -d "$src" ]]; then
+        echo "error: $origin: $src is not a directory" >&2
+        return 1
+    fi
+    real="$(cd "$src" && pwd -P)" || return 1
+
+    # Never expose the home directory as a whole, credentials, or the
+    # launcher's own config and state (which includes this mount list).
+    if _msb_agent_path_within "$HOME" "$real"; then
+        echo "error: $origin: $src contains your home directory; mount something narrower" >&2
+        return 1
+    fi
+    for protected in .ssh .gnupg .aws .azure .kube .docker .netrc .config \
+                     .local/state .claude .claude.json .pi Library/Keychains; do
+        protected="$HOME/$protected"
+        if _msb_agent_path_within "$real" "$protected" || \
+           _msb_agent_path_within "$protected" "$real"; then
+            echo "error: $origin: $src is or overlaps $protected, which may hold credentials" >&2
+            return 1
+        fi
+    done
+    for protected in "$_MSB_AGENT_CONFIG_DIR" \
+                     "${XDG_STATE_HOME:-$HOME/.local/state}/msb-agent"; do
+        if _msb_agent_path_within "$real" "$protected" || \
+           _msb_agent_path_within "$protected" "$real"; then
+            echo "error: $origin: $src is or overlaps the launcher's own $protected" >&2
+            return 1
+        fi
+    done
+
+    # Already mounted, with the real .env hidden; mounting a parent would
+    # show it again.
+    if _msb_agent_path_within "$dir" "$real"; then
+        echo "error: $origin: $src contains the project, which is already mounted" >&2
+        return 1
+    fi
+
+    if [[ -n "$target" ]]; then
+        extra_mounts+=( "$real|$target|${mode:-ro}|0" )
+    else
+        extra_mounts+=( "$real|/workspace/$(basename "$real")|${mode:-ro}|1" )
+    fi
+}
+
+# ----------------------------------------------------------------
+# Collect and check the extra mounts for this launch into extra_mounts,
+# and set extra_label (recorded on the sandbox, since mounts can only
+# be set when it is created). Run after the checkout layout is known.
+# Returns 1 on a bad entry.
+# ----------------------------------------------------------------
+_msb_agent_extra_mounts() {
+    local key="${primary:-$dir}" base entry spec seen target mode rel host_mp
+    local other_target src git_dir_x git_common_x exclude=""
+    local -a collected=() env_entries=() mount_points=()
+
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        _msb_agent_add_extra_mount "$entry" "$key" "$_MSB_AGENT_MOUNTS_FILE" || return 1
+    done < <(_msb_agent_mount_file_entries "$_MSB_AGENT_MOUNTS_FILE" "$key")
+
+    read -r -d '' -a env_entries <<< "${MSB_AGENT_MOUNTS:-}" || true
+    for entry in ${env_entries[@]+"${env_entries[@]}"}; do
+        _msb_agent_add_extra_mount "$entry" "$key" MSB_AGENT_MOUNTS || return 1
+    done
+
+    for spec in ${extra_mounts[@]+"${extra_mounts[@]}"}; do
+        IFS='|' read -r src target mode _ <<< "$spec"
+
+        # The same entry given twice (file and env) is fine.
+        for seen in ${collected[@]+"${collected[@]}"}; do
+            [[ "${seen%|*}" == "${spec%|*}" ]] && continue 2
+        done
+
+        target="${target%/}"
+        case "$target/" in
+            */./*|*/../*|*//*)
+                echo "error: mount target $target must be a plain absolute path" >&2
+                return 1
+                ;;
+        esac
+        case "$target" in
+            ""|/bin|/bin/*|/boot|/boot/*|/dev|/dev/*|/etc|/etc/*|/lib*|/proc|/proc/*| \
+            /root|/root/*|/run|/run/*|/sbin|/sbin/*|/sys|/sys/*|/tmp|/usr|/usr/*| \
+            /var|/var/*|/home|/.msb|/.msb/*|/opt/msb-mounts|/opt/msb-mounts/*)
+                echo "error: mount target $target is a system directory" >&2
+                return 1
+                ;;
+        esac
+        if _msb_agent_path_within "$guest_dir" "$target"; then
+            echo "error: mount target $target would hide the project at $guest_dir" >&2
+            return 1
+        fi
+        for seen in ${collected[@]+"${collected[@]}"}; do
+            IFS='|' read -r _ other_target _ _ <<< "$seen"
+            if _msb_agent_path_within "$target" "$other_target" || \
+               _msb_agent_path_within "$other_target" "$target"; then
+                echo "error: mount targets $other_target and $target are the same or nested" >&2
+                return 1
+            fi
+        done
+
+        # A target inside the checkout needs a mount point there. It
+        # stays an empty directory on the host, and is excluded from git
+        # so the agent does not commit the other tree into this one.
+        if _msb_agent_path_within "$target" "$guest_dir"; then
+            rel="${target#"$guest_dir"/}"
+            case "/$rel" in
+                /.git|/.git/*|/.env|/.env.agent|/.msb-agent|/.msb-agent/*|"/.$tool"|"/.$tool"/*)
+                    echo "error: mount target $target is reserved by the launcher" >&2
+                    return 1
+                    ;;
+            esac
+
+            host_mp="$dir/$rel"
+            if [[ -e "$host_mp" && ! -d "$host_mp" ]] || [[ -L "$host_mp" ]]; then
+                echo "error: mount target $target is not a directory in the project ($host_mp)" >&2
+                return 1
+            fi
+            if [[ "${spec##*|}" == 1 && -n "$(ls -A "$host_mp" 2>/dev/null)" ]]; then
+                {
+                    echo "error: the project already has $rel/, so $src can't be mounted"
+                    echo "       at its default $target; give a target, e.g. $src:/workspace/<name>"
+                } >&2
+                return 1
+            fi
+            mount_points+=( "$rel" )
+        fi
+
+        collected+=( "$spec" )
+        echo "Extra mount: $src -> $target ($mode)"
+
+        # A linked worktree's .git points at its main repository by
+        # absolute path, so mount that there too.
+        if git_dir_x="$(git -C "$src" rev-parse --path-format=absolute --git-dir 2>/dev/null)" && \
+           [[ "$(git -C "$src" rev-parse --show-toplevel 2>/dev/null)" == "$src" ]]
+        then
+            git_common_x="$(git -C "$src" rev-parse --path-format=absolute --git-common-dir)"
+            git_common_x="$(cd "$git_common_x" && pwd -P)"
+
+            if [[ "$git_dir_x" != "$src"/* && "$(cd "$git_dir_x" && pwd -P)" != "$git_common_x" ]]; then
+                if (( linked_worktree )) && [[ "$git_common_x" == "$git_common" ]]; then
+                    :
+                elif [[ " ${collected[*]} " == *" $git_common_x|$git_common_x|"* ]]; then
+                    :
+                else
+                    collected+=( "$git_common_x|$git_common_x|$mode|0" )
+                    echo "             with its git data at $git_common_x ($mode)"
+                fi
+            elif [[ "$git_dir_x" != "$src"/* ]]; then
+                echo "warning: $src keeps its git data outside it (a submodule?); git will not work at $target" >&2
+            fi
+        fi
+
+        if [[ "$mode" == rw ]] && _msb_agent_path_within "$_MSB_AGENT_LIB_DIR" "$src"; then
+            echo "warning: $src holds this launcher, which runs on the host; the agent can change it" >&2
+        fi
+    done
+
+    extra_mounts=( ${collected[@]+"${collected[@]}"} )
+
+    if (( ${#mount_points[@]} > 0 )) && [[ -n "$git_dir" ]]; then
+        exclude="$(git -C "$dir" rev-parse --path-format=absolute --git-path info/exclude 2>/dev/null)"
+    fi
+
+    for rel in ${mount_points[@]+"${mount_points[@]}"}; do
+        mkdir -p "$dir/$rel" || return 1
+
+        if [[ -n "${exclude:-}" ]] && ! grep -qxF "/$rel/" "$exclude" 2>/dev/null; then
+            mkdir -p "$(dirname "$exclude")" \
+            && printf '/%s/\n' "$rel" >> "$exclude" \
+            && echo "Excluded /$rel/ from git (in $exclude)"
+        fi
+    done
+
+    extra_label=none
+    if (( ${#extra_mounts[@]} > 0 )); then
+        extra_label="$(printf '%s\n' "${extra_mounts[@]%|*}" | sort | cksum | cut -d' ' -f1)"
+    fi
+}
+
+# ----------------------------------------------------------------
 # Print the deepest directory that contains both absolute paths.
 # ----------------------------------------------------------------
 _msb_agent_common_dir() {
@@ -593,6 +861,10 @@ msb_agent_run() {
     # created.
     local -a agent_mounts=()
     local mounts_label=none
+    # Extra host directories (see _msb_agent_extra_mounts), likewise
+    # recorded in a label.
+    local -a extra_mounts=() extra_mount_args=() extra_restore_args=()
+    local extra_label=none
     local git_dir="" git_common="" primary="" source_name=""
     local linked_worktree=0
     local host_uid host_gid
@@ -969,6 +1241,17 @@ msb_agent_run() {
         done
     fi
 
+    _msb_agent_extra_mounts || return 1
+
+    local xspec xsrc xtarget xmode xopts
+    for xspec in ${extra_mounts[@]+"${extra_mounts[@]}"}; do
+        IFS='|' read -r xsrc xtarget xmode _ <<< "$xspec"
+        xopts="uid=$host_uid,gid=$host_gid,host-perms=private"
+        [[ "$xmode" == ro ]] && xopts="ro,$xopts"
+        extra_mount_args+=( --mount-dir "$xsrc:$xtarget:$xopts" )
+        extra_restore_args+=( -v "$xsrc:$xtarget:$xopts" )
+    done
+
     # ------------------------------------------------------------
     # .env handling. Decided when a sandbox is created (mounts can't
     # change later) and recorded in the msb-agent-env label:
@@ -1027,6 +1310,18 @@ msb_agent_run() {
                 echo "       of host config directories than this launch asks for. msb can't"
                 echo "       change mounts in place; remove the sandbox (installed packages"
                 echo "       are lost) or change the mount setting back:"
+                echo "           msb rm $name"
+            } >&2
+            return 1
+        fi
+
+        have_mounts="$(_msb_agent_label "$name" msb-agent-extra-mounts none)"
+        if [[ -n "$have_mounts" && "$have_mounts" != "$extra_label" ]]; then
+            {
+                echo "error: sandbox $name was created with different extra mounts than"
+                echo "       this launch asks for ($_MSB_AGENT_MOUNTS_FILE, MSB_AGENT_MOUNTS)."
+                echo "       msb can't change mounts in place; remove the sandbox (installed"
+                echo "       packages are lost) or change the mounts back:"
                 echo "           msb rm $name"
             } >&2
             return 1
@@ -1099,6 +1394,7 @@ msb_agent_run() {
             ${env_mount_spec:+-v "$env_mount_spec"} \
             "${restore_mounts[@]}" \
             ${ro_restore_args[@]+"${ro_restore_args[@]}"} \
+            ${extra_restore_args[@]+"${extra_restore_args[@]}"} \
             "${net_restore_args[@]}"
         then
             rm -rf "$tmpdir"
@@ -1112,6 +1408,7 @@ msb_agent_run() {
             --label "msb-agent-env=$env_mode" \
             --label "msb-agent-layout=$guest_dir" \
             --label "msb-agent-mounts=$mounts_label" \
+            --label "msb-agent-extra-mounts=$extra_label" \
             >/dev/null \
         || echo "warning: could not label sandbox $name" >&2
 
@@ -1155,6 +1452,8 @@ msb_agent_run() {
             )
         fi
 
+        create_mounts+=( ${extra_mount_args[@]+"${extra_mount_args[@]}"} )
+
         msb create \
             --name "$name" \
             --cpus 4 \
@@ -1166,6 +1465,7 @@ msb_agent_run() {
             --label "msb-agent-env=$env_mode" \
             --label "msb-agent-layout=$guest_dir" \
             --label "msb-agent-mounts=$mounts_label" \
+            --label "msb-agent-extra-mounts=$extra_label" \
             --trust-host-cas \
             "${secret_args[@]}" \
             "${create_mounts[@]}" \
@@ -1607,6 +1907,20 @@ msb_agent_run() {
 
     if [[ -n "$guest_gitdir" ]]; then
         extra_system_prompt+=$'\n\n'"The project you were started in is a git submodule, and you are working in $guest_dir. Only this submodule's working tree and its own git data are present under /workspace; the rest of the superproject is deliberately not available, so keep your changes within this directory."
+    fi
+
+    if (( ${#extra_mounts[@]} > 0 )); then
+        local xlist=""
+        for xspec in "${extra_mounts[@]}"; do
+            IFS='|' read -r xsrc xtarget xmode _ <<< "$xspec"
+            [[ "$xsrc" == "$xtarget" ]] && continue
+            if [[ "$xmode" == rw ]]; then
+                xlist+="${xlist:+; }$xtarget (read-write)"
+            else
+                xlist+="${xlist:+; }$xtarget (read-only)"
+            fi
+        done
+        extra_system_prompt+=$'\n\n'"The user has also mounted these host directories: $xlist. Each is a separate directory tree, not part of the project in $guest_dir (git ignores those inside it). Read-only ones are reference data: use them in place rather than copying them. Read-write ones may be other repositories you can change as part of the task; run git inside each one to see and commit its changes."
     fi
 
     if [[ "$env_mode" == squashed ]]; then

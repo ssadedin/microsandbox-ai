@@ -18,7 +18,8 @@ inconvenient and introduces many limitations and challenges. For example:
 These scripts facilitate some niceties including:
 
 - auto-creation of sandbox with a simple model:
-  - whatever folder you run it in becomes the only folder it can see, staged into the VM 
+  - whatever folder you run it in becomes the only folder it can see (plus any you choose to
+    mount, see "Mounting other directories"), staged into the VM
     under `/workspace`
   - smart setup to stage in Git repository config and files so 
     the AI model can see git and commit locally but not push commits anywhere
@@ -204,6 +205,53 @@ mounted from `~/.claude` and are no longer copied. Pi has the same option, see
   directory already inside the sandbox is left alone, with a warning.
 - A running session may only pick up edits when it rescans, so start a new
   session after changing skills.
+
+## Mounting other directories
+
+To give the agent large reference data without copying it, or other
+repositories to change alongside the project, list them in your project's
+section of `~/.config/msb-agent/mounts` on the host:
+
+```
+# [main checkout of the project]  (~ is expanded)
+[~/src/app]
+# read-only at /workspace/reference-genomes
+~/data/reference-genomes
+# read-write at /workspace/shared-lib
+../shared-lib:rw
+# read-write at a chosen path, and read-only outside /workspace
+../tools:/workspace/vendor/tools:rw
+/Volumes/scratch/runs:/data/runs
+```
+
+Each line is `SRC[:TARGET][:ro|rw]` (`#` starts a comment line). The target
+defaults to `/workspace/<name of SRC>` and the mode to `ro`, so writing is
+always opted in. A relative `SRC` is relative to the section's checkout. A
+linked worktree uses its main checkout's section. `MSB_AGENT_MOUNTS`
+(whitespace separated, same syntax) adds entries for one launch.
+
+- **The list lives on the host only.** The file is never mounted, so nothing
+  in the sandbox can read or change it. Entries that are or contain your home
+  directory, credential directories (`~/.ssh`, `~/.aws`, `~/.config`,
+  `~/.claude`, ...) or the project itself are refused.
+- **Read-only is enforced by `msb` on the host**, as for skills above.
+  Read-write entries can be changed by the agent, including a repository's
+  `.git/hooks`, which then run on your host when you use git there. Treat them
+  like the project checkout.
+- **Targets inside the checkout** get an empty mount point directory in it on
+  the host, which is also added to the repository's `.git/info/exclude`, so
+  the agent does not commit the other tree into this one. A default target
+  that the project already uses is refused; give a target instead.
+- **Git works in a mounted repository**, including a linked worktree (its main
+  repository's git data is also mounted at its host path). A submodule keeps
+  its git data in its superproject, so git does not work in a mounted one;
+  mount the superproject instead.
+- **Mounts are fixed when the sandbox is created.** Changing the list for an
+  existing sandbox is refused with a `msb rm <sandbox>` hint.
+- Each worktree gets its own sandbox, and a read-write entry is shared by all
+  of them, so agents in two worktrees can edit the same tree at once.
+  `--gitlab-issue` only covers the project and its submodules, not mounted
+  repositories.
 
 ## Behind a TLS-intercepting network
 
