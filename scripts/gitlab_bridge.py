@@ -130,6 +130,7 @@ ISSUE_MARK = "<!-- msb-agent:merge-requests -->"
 
 # Everything GitLab may treat as a line break.
 NEWLINE_RE = re.compile(r"\r\n?|[\n\v\f\x85\u2028\u2029]")
+QUICK_ACTION_RE = re.compile(r"^([ \t]*)/", re.M)
 
 
 # ----------------------------------------------------------------
@@ -199,6 +200,15 @@ def sniff_image(data):
 def one_line(text, limit):
     text = re.sub(r"\s+", " ", text).replace("<!--", "").replace("-->", "").strip()
     return text[:limit]
+
+
+def neutralise(text):
+    """Escape quick actions: GitLab runs any line starting with / with the token's rights.
+
+    Every such line is escaped, not just known commands, and code blocks too,
+    rather than relying on matching GitLab's own parsing. "\\/" renders as "/".
+    """
+    return QUICK_ACTION_RE.sub(r"\1\\/", NEWLINE_RE.sub("\n", text))
 
 
 def links_section(issue_ref, requires, related):
@@ -302,6 +312,10 @@ class Bridge:
         if NEWLINE_RE.search(value):
             raise BridgeError(f"'{key}' must be a single line of text")
         return value
+
+    @classmethod
+    def _markdown(cls, req, key, required=True):
+        return neutralise(cls._text(req, key, required=required))
 
     # -- reading ---------------------------------------------------
 
@@ -462,13 +476,13 @@ class Bridge:
     # -- commenting ------------------------------------------------
 
     def comment_issue(self, req):
-        body = self._text(req, "body")
+        body = self._markdown(req, "body")
         self._spend_write()
         note = self.gl.call("POST", self._issue_path() + "/notes", body={"body": body + FOOTER})
         return f"Comment posted on issue {self.s.issue['ref']} (note {note.get('id')})."
 
     def comment_merge_request(self, req):
-        body = self._text(req, "body")
+        body = self._markdown(req, "body")
         r = self._repo(req)
         mr = self._open_mr(r)
         if mr is None:
@@ -485,7 +499,7 @@ class Bridge:
     def _plan(self, req):
         """Validate everything first; return the repos to submit. Nothing is sent on error."""
         title = self._title(req, "title")
-        description = self._text(req, "description", required=False)
+        description = self._markdown(req, "description", required=False)
 
         overrides = req.get("overrides") or []
         requires = req.get("requires") or []
@@ -525,10 +539,9 @@ class Bridge:
                 errors.append(f"overrides: {o.get('repo') if isinstance(o, dict) else o!r} "
                               f"is not a repo with commits to submit (those are: {sorted(paths)})")
                 continue
-            body = o.get("description")
             own[o["repo"]] = {
                 "title": self._title(o, "title", required=False) or title,
-                "description": body.strip() if isinstance(body, str) and body.strip() else description}
+                "description": self._markdown(o, "description", required=False) or description}
         deps = {}
         for q in requires:
             ok = (isinstance(q, dict) and q.get("repo") in paths and q.get("needs") in paths
@@ -599,7 +612,7 @@ class Bridge:
             mr = mrs[path]
             related = [(refs[p], p) for p in refs if p != path]
             requires = [(refs[need], reason) for need, reason in deps.get(path, []) if need in refs]
-            section = links_section(self.s.issue["ref"], requires, related)
+            section = neutralise(links_section(self.s.issue["ref"], requires, related))
             new = replace_links(mr.get("description") or "", section)
             if new != (mr.get("description") or ""):
                 try:
@@ -612,7 +625,7 @@ class Bridge:
         lines = [ISSUE_MARK, f"Merge requests for branch `{self.branch}`:"]
         lines += [f"- {refs[r['path']]} ({r['path']}): {mrs[r['path']].get('title', '')}"
                   for r, _ in touched if r["path"] in refs]
-        body = "\n".join(lines) + FOOTER
+        body = neutralise("\n".join(lines)) + FOOTER
         try:
             path = self._issue_path()
             me = self.gl.me().get("id")
