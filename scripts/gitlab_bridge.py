@@ -128,6 +128,9 @@ LINKS_START = "<!-- msb-agent:links:start -->"
 LINKS_END = "<!-- msb-agent:links:end -->"
 ISSUE_MARK = "<!-- msb-agent:merge-requests -->"
 
+# Everything GitLab may treat as a line break.
+NEWLINE_RE = re.compile(r"\r\n?|[\n\v\f\x85\u2028\u2029]")
+
 
 # ----------------------------------------------------------------
 # Output formatting. Ticket text is written by other people and goes
@@ -292,6 +295,13 @@ class Bridge:
         if len(value) > limit:
             raise BridgeError(f"'{key}' is too long ({len(value)} > {limit} characters)")
         return value.strip()
+
+    @classmethod
+    def _title(cls, req, key, required=True):
+        value = cls._text(req, key, MAX_TITLE, required)
+        if NEWLINE_RE.search(value):
+            raise BridgeError(f"'{key}' must be a single line of text")
+        return value
 
     # -- reading ---------------------------------------------------
 
@@ -474,9 +484,7 @@ class Bridge:
 
     def _plan(self, req):
         """Validate everything first; return the repos to submit. Nothing is sent on error."""
-        title = self._text(req, "title", MAX_TITLE)
-        if "\n" in title:
-            raise BridgeError("'title' must be a single line of text")
+        title = self._title(req, "title")
         description = self._text(req, "description", required=False)
 
         overrides = req.get("overrides") or []
@@ -519,7 +527,7 @@ class Bridge:
                 continue
             body = o.get("description")
             own[o["repo"]] = {
-                "title": self._text(o, "title", MAX_TITLE, required=False) or title,
+                "title": self._title(o, "title", required=False) or title,
                 "description": body.strip() if isinstance(body, str) and body.strip() else description}
         deps = {}
         for q in requires:
