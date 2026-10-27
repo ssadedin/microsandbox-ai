@@ -877,6 +877,27 @@ _msb_agent_run_setup() {
 }
 
 # ----------------------------------------------------------------
+# Print the host's IANA time zone name (e.g. Australia/Melbourne), from
+# TZ or the /etc/localtime link (macOS and most Linux), else nothing.
+# ----------------------------------------------------------------
+_msb_agent_host_timezone() {
+    local zone="${TZ#:}"
+
+    if [[ -z "$zone" ]]; then
+        zone="$(readlink /etc/localtime 2>/dev/null)"
+        if [[ "$zone" == *zoneinfo/* ]]; then
+            zone="${zone##*zoneinfo/}"
+        elif [[ -r /etc/timezone ]]; then
+            zone="$(< /etc/timezone)"
+        else
+            zone=""
+        fi
+    fi
+
+    [[ "$zone" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] && printf '%s' "$zone"
+}
+
+# ----------------------------------------------------------------
 # Print the deepest directory that contains both absolute paths.
 # ----------------------------------------------------------------
 _msb_agent_common_dir() {
