@@ -1767,7 +1767,9 @@ msb_agent_run() {
     fi
 
     # ------------------------------------------------------------
-    # Install sudo and passwordless sudo. Safe to run repeatedly.
+    # Install sudo and passwordless sudo, and follow the host's time
+    # zone (on every launch, so it follows the host when travelling).
+    # Safe to run repeatedly.
     # ------------------------------------------------------------
 
     msb exec -q "$name" -- \
@@ -1801,9 +1803,20 @@ msb_agent_run() {
                 > /etc/sudoers.d/pi-agent
 
             chmod 0440 /etc/sudoers.d/pi-agent
+
+            zone="$2"
+            if [[ -n "$zone" && -f "/usr/share/zoneinfo/$zone" ]]; then
+                if [[ "$(readlink /etc/localtime)" != "/usr/share/zoneinfo/$zone" ]]; then
+                    ln -sfn "/usr/share/zoneinfo/$zone" /etc/localtime
+                    printf "%s\n" "$zone" > /etc/timezone
+                fi
+            elif [[ -n "$zone" ]]; then
+                echo "warning: time zone $zone is not known in the sandbox; leaving it as is" >&2
+            fi
         ' \
         msb-agent-bootstrap \
         "$guest_user" \
+        "$(_msb_agent_host_timezone)" \
     || return 1
 
     # ------------------------------------------------------------
